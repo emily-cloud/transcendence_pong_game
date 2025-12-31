@@ -1,0 +1,438 @@
+# x-base: &base
+#   restart: unless-stopped
+#   networks:
+#     - transcendence-network
+
+services:
+
+  # base:
+  #   build:
+  #     context: ./services
+  #     dockerfile: Dockerfile.base
+  #   image: mybase/node18:latest
+  #   entrypoint: ["/bin/true"]
+
+  nginx:
+    build:
+      context: ..
+      dockerfile: transcendence/nginx/Dockerfile
+#    image: transcendence-nginx:latest
+    container_name: transcendence-nginx
+    env_file: ./.env
+    environment: 
+      - SERVER_NAME=${SERVER_NAME:-localhost}
+      - GATEWAY_PORT=${GATEWAY_PORT:-3000}
+      - GATEWAY_HOST=${GATEWAY_HOST:-gateway}
+      - CLIENT_MAX_BODY_SIZE=${CLIENT_MAX_BODY_SIZE:-10M}
+    ports:
+      - "8000:80"
+      - "8443:443"
+    # If you prefer to live-edit nginx.conf/ssl without rebuilds, keep these volumes.
+    # Otherwise, remove them to rely purely on the image content.
+    #volumes:
+    #  - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    #  - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - gateway
+    networks:
+      - transcendence-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -skf https://localhost/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  gateway:
+    build: ./services/gateway
+    #ports:
+    #  - "${GATEWAY_PORT:-3000}:${GATEWAY_PORT:-3000}"
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - USER_SERVICE_URL=${USER_SERVICE_URL:-http://user-service:3001}
+      - GAME_SERVICE_URL=${GAME_SERVICE_URL:-http://game-service:3002}
+      - LOG_SERVICE_URL=${LOG_SERVICE_URL:-http://log-service:3003}
+      - FRONT_END_URL=${FRONT_END_URL:-http://localhost:3004}
+    depends_on:
+      - user-service
+      - game-service
+      - log-service
+      - database
+    volumes:
+      - shared-data:/app/shared/
+      - avatar-uploads:/uploads/avatars:ro
+    networks:
+      - transcendence-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  user-service:
+    # <<: *base
+    build: ./services/user-service
+    # Port NOT exposed - only accessible via gateway
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - DATABASE_URL=${DATABASE_URL:-sqlite:/app/shared/database/transcendence.db}
+      - JWT_SECRET=${JWT_SECRET:-your-secret-key-change-in-production}
+      - LOG_SERVICE_URL=${LOG_SERVICE_URL:-http://log-service:3003}
+    depends_on:
+      # - base
+      - database
+    volumes:
+      # - shared-data:/app/shared/database/
+      - shared-data:/app/shared/
+      - avatar-uploads:/app/avatars
+    networks:
+      - transcendence-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  game-service:
+    # <<: *base
+    build: ./services/game-service
+    # Port NOT exposed - only accessible via gateway
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - DATABASE_URL=${DATABASE_URL:-sqlite:/app/shared/database/transcendence.db}
+      - USER_SERVICE_URL=${USER_SERVICE_URL:-http://user-service:3001}
+      - LOG_SERVICE_URL=${LOG_SERVICE_URL:-http://log-service:3003}
+      - GAME_SERVICE_HOST=${GAME_SERVICE_HOST:-localhost}
+      - GAME_SERVICE_PORT=${GAME_SERVICE_PORT:-3002}
+    depends_on:
+      # - base
+      - database
+    volumes:
+      - shared-data:/app/shared/
+    networks:
+      - transcendence-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  log-service:
+    # <<: *base
+    build: ./services/log-service
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - LOGSTASH_URL=${LOGSTASH_URL:-http://logstash:5000}
+    depends_on:
+      # - base
+      - database
+    volumes:
+      - shared-data:/app/shared/
+    networks:
+      - transcendence-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s  # Give more time for startup
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: transcendence-elasticsearch
+    profiles: ["monitoring", "full"]
+    env_file:
+      - .env
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - cluster.routing.allocation.disk.threshold_enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      - bootstrap.memory_lock=false  # Fixes memory warning
+      - xpack.ml.enabled=false       # Disable ML features
+      - xpack.watcher.enabled=false  # Disable watcher
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    # Port NOT exposed - internal use only
+    # ulimits removed - causes permission issues on restricted systems (school computers)
+    # ulimits:
+    #   memlock:
+    #     soft: -1
+    #     hard: -1
+    networks:
+      - transcendence-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=30s || exit 1"]
+      interval: 20s
+      timeout: 15s
+      retries: 8
+      start_period: 60s
+
+  elasticsearch-setup:
+    image: curlimages/curl:8.5.0
+    profiles: ["monitoring", "full"]
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ./monitoring/elasticsearch:/config:ro
+    command: >
+      sh -c '
+        echo "Configuring Elasticsearch ILM...";
+        sleep 30;
+        curl -X PUT "http://elasticsearch:9200/_ilm/policy/transcendence-logs-policy" \
+          -H "Content-Type: application/json" \
+          -d @/config/ilm-policy.json;
+        echo "✅ Data retention policy set to 30 days"
+      '
+    networks:
+      - transcendence-network
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.11.0
+    container_name: transcendence-logstash
+    profiles: ["monitoring", "full"]
+    env_file:
+      - .env
+    environment:
+      - "LS_JAVA_OPTS=${LS_JAVA_OPTS:--Xms256m -Xmx256m}"
+      - ENVIRONMENT=${NODE_ENV:-development}
+    ports:
+      - "5044:5000"  # EXPOSED - For external log testing
+    volumes:
+      - ./monitoring/logstash/logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+      - ./monitoring/logs:/usr/share/logstash/logs:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - transcendence-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9600/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: transcendence-kibana
+    profiles: ["monitoring", "full"]
+    env_file:
+      - .env
+    environment:
+      - ELASTICSEARCH_HOSTS=${ELASTICSEARCH_URL:-http://elasticsearch:9200}
+      - SERVER_PUBLICBASEURL=${KIBANA_URL:-http://localhost:5601}
+      - XPACK_SECURITY_ENABLED=false
+      - XPACK_MONITORING_ENABLED=false
+      - XPACK_WATCHER_ENABLED=false
+      - XPACK_GRAPH_ENABLED=false
+      - XPACK_REPORTING_ENABLED=false
+      - XPACK_ML_ENABLED=false
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=${KIBANA_ENCRYPTION_KEY}
+      - XPACK_REPORTING_ENCRYPTIONKEY=${KIBANA_REPORTING_KEY}
+      - XPACK_SECURITY_ENCRYPTIONKEY=${KIBANA_SECURITY_KEY}
+     
+    ports:
+      - "5601:5601"  # EXPOSED - Web UI
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - transcendence-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5601/api/status || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  kibana-setup:
+    image: curlimages/curl:8.5.0
+    container_name: transcendence-kibana-setup
+    profiles: ["monitoring", "full"]
+    depends_on:
+      kibana:
+        condition: service_healthy
+    volumes:
+      - ./monitoring/kibana/saved-objects:/saved-objects:ro
+    networks:
+      - transcendence-network
+    command: >
+      sh -c '
+        echo "Waiting for Kibana to be fully ready...";
+        sleep 10;
+        
+        if [ -f /saved-objects/kibana-export.ndjson ]; then
+          echo "Found saved objects file, importing...";
+          
+          RESPONSE=$$(curl -X POST "http://kibana:5601/api/saved_objects/_import?overwrite=true" \
+            -H "kbn-xsrf: true" \
+            --form file=@/saved-objects/kibana-export.ndjson \
+            -w "\n%{http_code}" \
+            -s);
+          
+          HTTP_CODE=$$(echo "$$RESPONSE" | tail -n1);
+          
+          if [ "$$HTTP_CODE" = "200" ]; then
+            echo "✅ Successfully imported Kibana dashboards!";
+          else
+            echo "⚠️  Import returned HTTP $$HTTP_CODE";
+          fi;
+        else
+          echo "ℹ️  No saved objects found.";
+          echo "   Create dashboards at http://localhost:5601";
+        fi;
+        
+        echo "";
+        echo "========================================";
+        echo "🎉 Kibana ready at: http://localhost:5601";
+        echo "========================================";
+      '
+    restart: "no"
+
+  tournament-service:
+    # <<: *base
+    build: ./services/tournament-service
+    # Port NOT exposed - only accessible via gateway
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - DATABASE_URL=${DATABASE_URL:-sqlite:/app/shared/database/transcendence.db}
+      - USER_SERVICE_URL=${USER_SERVICE_URL:-http://user-service:3001}
+      - GAME_SERVICE_URL=${GAME_SERVICE_URL:-http://game-service:3002}
+      - LOG_SERVICE_URL=${LOG_SERVICE_URL:-http://log-service:3003}
+      - GAME_SERVICE_HOST=${GAME_SERVICE_HOST:-localhost}
+      - GAME_SERVICE_PORT=${GAME_SERVICE_PORT:-3002}
+    depends_on:
+      # - base
+      - database
+    volumes:
+      - shared-data:/app/shared/
+    networks:
+      - transcendence-network
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get({host:'127.0.0.1',port:3005,path:'/health',family:4}, (res) => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+#      target: production  # Use development for hot reload
+    ports:
+      - "${FRONTEND_PORT:-3004}:${FRONTEND_PORT:-3004}"
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - VITE_API_BASE=${VITE_API_BASE:-http://localhost:3000/user-service}
+      - VITE_GATEWAY_BASE=${VITE_GATEWAY_BASE:-http://localhost:3000}
+      - VITE_WS_BASE=${VITE_WS_BASE:-ws://localhost:3000}
+    volumes:
+      - ./frontend/src:/app/src:ro  # Hot reload for development
+      - avatar-uploads:/app/public/avatars  # Persistentes Volume
+      - ./frontend/public:/app/public 
+    networks:
+      - transcendence-network
+    depends_on:
+      - gateway
+
+  # database:
+  #   image: alpine:latest
+  #   command: sh -c "mkdir -p /shared/database && touch /shared/database/transcendence.db && tail -f /dev/null"
+  #   volumes:
+  #     - shared-data:/shared
+  #   networks:
+  #     - transcendence-network
+
+  database:
+    build:
+      context: .  # ← Root context
+      dockerfile: ./services/database/Dockerfile
+    container_name: transcendence-database
+    volumes:
+      - shared-data:/app/shared
+    environment:
+      - NODE_ENV=development
+    # build: ./services/database
+    # volumes:
+    #   - shared-data:/app/shared/database/
+    # environment:
+    #   - NODE_ENV=development
+
+  sqlite-web:
+    image: ghcr.io/coleifer/sqlite-web:latest
+    container_name: sqlite-web
+    restart: unless-stopped
+    networks:
+      - transcendence-network
+    ports:
+      - "127.0.0.1:8080:8080"
+      # - "8082:8080"
+    volumes:
+      - shared-data:/app/shared/
+    command: ["sqlite_web", "/app/shared/database/transcendence.db", "--host", "0.0.0.0", "--port", "8080"]
+    depends_on:
+      - database
+    labels:
+      - "com.transcendence.description=SQLite Web Admin Interface"
+
+  database-service:
+    build: ./services/database-service
+    # ports:
+    #   - "3006:3006"
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - DATABASE_URL=${DATABASE_URL:-sqlite:/app/shared/database/transcendence.db}
+      - PORT=3006
+    depends_on:
+      - database
+    volumes:
+      - shared-data:/app/shared/
+      # - shared-data:/app/shared
+      # - shared-data:/shared
+    networks:
+      - transcendence-network
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3006/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  health-checker:
+    image: curlimages/curl
+    volumes:
+      - ./health-check.sh:/health-check.sh:ro
+    entrypoint: ["sh", "/health-check.sh"]
+    networks:
+      - transcendence-network
+    depends_on:
+      - gateway
+      - user-service
+      - game-service
+
+volumes:
+  shared-data:
+  elasticsearch-data:
+  avatar-uploads:  
+
+networks:
+  transcendence-network:
+    driver: bridge

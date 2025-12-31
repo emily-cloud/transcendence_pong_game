@@ -1,0 +1,715 @@
+name: Docker Build Validation
+
+on:
+  push:
+    branches:
+      - user-service
+      - microservices-refactor
+      - main
+      - log-service
+      - db-service-api
+      - tournament_new
+      - shenya-bug-fixes
+      #- fix-gateway-timeout-queue
+  pull_request:
+    branches:
+      - user-service
+      - microservices-refactor
+      - main
+
+jobs:
+  validate-docker-compose:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create test .env file from template
+        run: |
+          cd transcendence
+          # Copy from .env.example and override with CI-specific values
+          # cp .env.example .env
+          touch .env
+          # # Override with CI-specific test values
+          cat >> .env << EOF
+          # CI/CD Override values - NOT FOR PRODUCTION
+          NODE_ENV=test
+          DATABASE_URL=sqlite:/app/shared/database/transcendence.db
+          JWT_SECRET=ci-test-secret-not-for-production
+          
+          # Frontend URLs (Browser → nginx → gateway) - HTTP for CI testing  
+          VITE_API_BASE=http://localhost:8000/api
+          VITE_GATEWAY_BASE=http://localhost:8000/api
+          VITE_WS_BASE=ws://localhost:8000/ws
+          FRONT_END_URL=http://localhost:8000
+          
+          # Backend URLs (Docker internal network)
+          USER_SERVICE_URL=http://user-service:3001
+          GAME_SERVICE_URL=http://game-service:3002
+          LOG_SERVICE_URL=http://log-service:3003
+          TOURNAMENT_SERVICE_URL=http://tournament-service:3005
+          GATEWAY_URL=http://gateway:3000
+          # Database settings
+          DB_HOST=localhost
+          DB_PORT=5432
+          DB_USER=transcendence
+          DB_PASSWORD=transcendence
+          DB_NAME=transcendence
+          # Service ports
+          GATEWAY_PORT=3000
+          USER_SERVICE_PORT=3001
+          GAME_SERVICE_PORT=3002
+          LOG_SERVICE_PORT=3003
+          TOURNAMENT_SERVICE_PORT=3004
+          FRONTEND_PORT=3005
+          # Service hosts (internal Docker network)
+          USER_SERVICE_HOST=user-service
+          GAME_SERVICE_HOST=game-service
+          LOG_SERVICE_HOST=log-service
+          TOURNAMENT_SERVICE_HOST=tournament-service
+          # External API keys and secrets
+          OAUTH_CLIENT_ID=test-client-id
+          OAUTH_CLIENT_SECRET=test-client-secret
+          OAUTH_REDIRECT_URI=http://localhost:3000/auth/callback
+          # Development settings
+          DEBUG=false
+          LOG_LEVEL=info
+          # Monitoring
+          ENABLE_PROMETHEUS=false
+          PROMETHEUS_PORT=9090
+          GRAFANA_PORT=3001
+          # Frontend build settings
+          VITE_APP_NAME=Transcendence
+          VITE_APP_VERSION=1.0.0
+          EOF
+          echo "✅ Test .env file created for CI"
+
+      - name: Validate docker-compose.yml syntax
+        run: |
+          cd transcendence
+          docker compose -f docker-compose.yml config > /dev/null
+          echo "✅ docker-compose.yml syntax is valid"
+
+      - name: Validate docker-compose.dev.yml syntax
+        run: |
+          cd transcendence
+          if [ -f docker-compose.dev.yml ]; then
+            docker compose -f docker-compose.dev.yml config > /dev/null
+            echo "✅ docker-compose.dev.yml syntax is valid"
+          else
+            echo "ℹ️ docker-compose.dev.yml not found, skipping"
+          fi
+
+  build-services:
+    runs-on: ubuntu-latest
+    needs: validate-docker-compose
+    
+    strategy:
+      matrix:
+        service:
+          - gateway
+          - user-service
+          - game-service
+          - log-service
+          - tournament-service
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Verify service files exist
+        run: |
+          echo "Checking ${{ matrix.service }} files..."
+          ls -la transcendence/services/${{ matrix.service }}/
+          
+          if [ ! -f transcendence/services/${{ matrix.service }}/Dockerfile ]; then
+            echo "❌ Dockerfile missing for ${{ matrix.service }}"
+            exit 1
+          fi
+          
+          if [ ! -f transcendence/services/${{ matrix.service }}/package.json ]; then
+            echo "❌ package.json missing for ${{ matrix.service }}"
+            exit 1
+          fi
+          
+          # Check for main source file (either .js or .ts)
+          if [ -f transcendence/services/${{ matrix.service }}/src/index.js ]; then
+            echo "✅ src/index.js found for ${{ matrix.service }}"
+          elif [ -f transcendence/services/${{ matrix.service }}/src/index.ts ]; then
+            echo "✅ src/index.ts found for ${{ matrix.service }}"
+          else
+            echo "❌ Neither src/index.js nor src/index.ts found for ${{ matrix.service }}"
+            exit 1
+          fi
+          
+          echo "✅ All required files exist for ${{ matrix.service }}"
+
+      - name: Build ${{ matrix.service }} Docker image
+        run: |
+          cd transcendence
+          docker build -t ${{ matrix.service }}:test ./services/${{ matrix.service }}
+          echo "✅ ${{ matrix.service }} built successfully"
+
+      - name: Test ${{ matrix.service }} image basic functionality
+        run: |
+          # Test that the image contains Node.js
+          docker run --rm ${{ matrix.service }}:test node --version
+          
+          # Test that the image has the expected structure
+          docker run --rm ${{ matrix.service }}:test ls -la /app
+          
+          echo "✅ ${{ matrix.service }} image basic tests passed"
+
+  build-frontend:
+    runs-on: ubuntu-latest
+    needs: validate-docker-compose
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Verify frontend files exist
+        run: |
+          echo "Checking frontend files..."
+          ls -la transcendence/frontend/
+          
+          if [ ! -f transcendence/frontend/Dockerfile ]; then
+            echo "❌ Frontend Dockerfile missing"
+            exit 1
+          fi
+          
+          if [ ! -f transcendence/frontend/package.json ]; then
+            echo "❌ Frontend package.json missing"
+            exit 1
+          fi
+          
+          echo "✅ Frontend required files exist"
+
+      - name: Build frontend Docker image
+        run: |
+          cd transcendence
+          docker build -t frontend:test ./frontend
+          echo "✅ Frontend built successfully"
+
+  test-shared-resources:
+    runs-on: ubuntu-latest
+    needs: validate-docker-compose
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify shared directory structure
+        run: |
+          echo "Checking shared directory structure..."
+          
+          # Check if shared directories exist
+          for dir in config database types utils; do
+            if [ -d "transcendence/shared/$dir" ]; then
+              echo "✅ transcendence/shared/$dir exists"
+              ls -la transcendence/shared/$dir/
+            else
+              echo "⚠️ transcendence/shared/$dir missing"
+            fi
+          done
+
+      - name: Verify monitoring configuration
+        run: |
+          echo "Checking monitoring directory..."
+          
+          if [ -d "transcendence/monitoring" ]; then
+            echo "✅ Monitoring directory exists"
+            ls -la transcendence/monitoring/
+            
+            # Check for monitoring configurations
+            for subdir in kibana logstash; do
+              if [ -d "transcendence/monitoring/$subdir" ]; then
+                echo "✅ transcendence/monitoring/$subdir exists"
+              else
+                echo "⚠️ transcendence/monitoring/$subdir missing"
+              fi
+            done
+          else
+            echo "⚠️ Monitoring directory missing"
+          fi
+
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: [build-services, build-frontend]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create .env file for testing
+        run: |
+          cd transcendence
+          cat > .env << EOF
+          NODE_ENV=test
+          DATABASE_URL=sqlite:/app/shared/database/transcendence.db
+          JWT_SECRET=test-secret-key-for-ci-only-not-secure
+          
+          # Frontend URLs (Browser → nginx → gateway) - HTTP for CI testing  
+          VITE_API_BASE=http://localhost:8000/api
+          VITE_GATEWAY_BASE=http://localhost:8000/api
+          VITE_WS_BASE=ws://localhost:8000/ws
+          FRONT_END_URL=http://localhost:8000
+          
+          # Backend URLs (Docker internal network)
+          USER_SERVICE_URL=http://user-service:3001
+          GAME_SERVICE_URL=http://game-service:3002
+          LOG_SERVICE_URL=http://log-service:3003
+          TOURNAMENT_SERVICE_URL=http://tournament-service:3005
+          GATEWAY_URL=http://gateway:3000
+          # Service ports
+          GATEWAY_PORT=3000
+          USER_SERVICE_PORT=3001
+          GAME_SERVICE_PORT=3002
+          LOG_SERVICE_PORT=3003
+          TOURNAMENT_SERVICE_PORT=3004
+          FRONTEND_PORT=3005
+          # Service hosts
+          USER_SERVICE_HOST=user-service
+          GAME_SERVICE_HOST=game-service
+          LOG_SERVICE_HOST=log-service
+          TOURNAMENT_SERVICE_HOST=tournament-service
+          # Development settings for testing
+          DEBUG=false
+          LOG_LEVEL=info
+          EOF
+          echo "✅ Test .env file created"
+
+      - name: Generate SSL certificates for testing
+        run: |
+          cd transcendence
+          echo "🔐 Generating SSL certificates for testing..."
+          chmod +x generate-ssl.sh
+          ./generate-ssl.sh
+          
+      - name: Start all services
+        run: |
+          cd transcendence
+          echo "Starting all services with nginx proxy..."
+          docker compose up -d --build
+          echo "⏳ Waiting for services to initialize..."
+          sleep 60
+
+      - name: Check container status
+        run: |
+          cd transcendence
+          echo "=== Container Status ==="
+          docker compose ps
+
+      - name: Test Gateway service via nginx
+        run: |
+          echo "Testing Gateway via nginx proxy..."
+          for i in {1..12}; do
+            # Try HTTPS first, fallback to HTTP for CI
+            if curl -k -f -s https://localhost:8443/api/health > /dev/null 2>&1; then
+              echo "✅ Gateway is responding via nginx (HTTPS)"
+              curl -k -s https://localhost:8443/api/health
+              break
+            elif curl -f -s http://localhost:8000/api/health > /dev/null 2>&1; then
+              echo "✅ Gateway is responding via nginx (HTTP fallback)"
+              curl -s http://localhost:8000/api/health
+              break
+            else
+              echo "⏳ Gateway + nginx not ready, attempt $i/12"
+              sleep 10
+              if [ $i -eq 12 ]; then
+                echo "❌ Gateway + nginx failed to respond after 120 seconds"
+                cd transcendence
+                echo "=== nginx Logs ==="
+                docker compose logs nginx | tail -100
+                echo "=== Gateway Logs ==="
+                docker compose logs gateway | tail -100
+                exit 1
+              fi
+            fi
+          done
+
+      - name: Test User Service via nginx → Gateway
+        run: |
+          echo "Testing User Service via nginx → Gateway..."
+          # Detect protocol and set variables
+          if curl -k -f -s https://localhost:8443/api/health > /dev/null 2>&1; then
+            BASE_URL="https://localhost:8443/api"
+            CURL_FLAGS="-k"
+            echo "🔒 Using HTTPS endpoints"
+          else
+            BASE_URL="http://localhost:8000/api"
+            CURL_FLAGS=""
+            echo "🔓 Using HTTP endpoints (CI fallback)"
+          fi
+          
+          for i in {1..5}; do
+            if curl $CURL_FLAGS -f -s $BASE_URL/user-service/health; then
+              echo "✅ User Service is responding via nginx → Gateway"
+              break
+            else
+              echo "⏳ User Service not ready via nginx → Gateway, attempt $i/5"
+              sleep 5
+              if [ $i -eq 5 ]; then
+                echo "❌ User Service failed to respond via nginx → Gateway"
+                echo "=== User Service Logs ==="
+                cd transcendence && docker compose logs user-service | tail -50
+                exit 1
+              fi
+            fi
+          done
+
+      - name: Test Game Service via nginx → Gateway
+        run: |
+          echo "Testing Game Service via nginx → Gateway..."
+          # Use same protocol detection as User Service test
+          if curl -k -f -s https://localhost:8443/api/health > /dev/null 2>&1; then
+            BASE_URL="https://localhost:8443/api"
+            CURL_FLAGS="-k"
+          else
+            BASE_URL="http://localhost:8000/api"
+            CURL_FLAGS=""
+          fi
+          
+          for i in {1..5}; do
+            if curl $CURL_FLAGS -f -s $BASE_URL/game-service/health; then
+              echo "✅ Game Service is responding via nginx → Gateway"
+              break
+            else
+              echo "⏳ Game Service not ready via nginx → Gateway, attempt $i/5"
+              sleep 5
+              if [ $i -eq 5 ]; then
+                echo "⚠️ Game Service not accessible via nginx → Gateway yet"
+                echo "ℹ️  This may be expected if game-service routes are not fully implemented"
+              fi
+            fi
+          done
+
+      - name: Test Log Service via nginx → Gateway
+        run: |
+          echo "Testing Log Service via nginx → Gateway..."
+          # Use same protocol detection
+          if curl -k -f -s https://localhost:8443/api/health > /dev/null 2>&1; then
+            BASE_URL="https://localhost:8443/api"
+            CURL_FLAGS="-k"
+          else
+            BASE_URL="http://localhost:8000/api"
+            CURL_FLAGS=""
+          fi
+          
+          for i in {1..5}; do
+            if curl $CURL_FLAGS -f -s $BASE_URL/log-service/health; then
+              echo "✅ Log Service is responding via nginx → Gateway"
+              break
+            else
+              echo "⏳ Log Service not ready via nginx → Gateway, attempt $i/5"
+              sleep 5
+              if [ $i -eq 5 ]; then
+                echo "⚠️ Log Service not accessible via nginx → Gateway yet"
+                echo "ℹ️  This may be expected if log-service routes are not fully implemented"
+              fi
+            fi
+          done
+
+      - name: Test inter-service communication
+        run: |
+          cd transcendence
+          echo "Testing internal service-to-service communication..."
+
+          # Test that gateway can reach other services internally
+          echo "Testing Gateway → User Service (internal)..."
+          if docker compose exec -T gateway curl -f -s http://user-service:3001/health > /dev/null 2>&1; then
+            echo "✅ Gateway ↔ User Service communication works"
+          else
+            echo "❌ Gateway cannot reach User Service internally"
+            exit 1
+          fi
+          
+          echo "Testing Gateway → Game Service (internal)..."
+          if docker compose exec -T gateway curl -f -s http://game-service:3002/health > /dev/null 2>&1; then
+            echo "✅ Gateway ↔ Game Service communication works"
+          else
+            echo "❌ Gateway cannot reach Game Service internally"
+            exit 1
+          fi
+          
+          echo "Testing Gateway → Log Service (internal)..."
+          if docker compose exec -T gateway curl -f -s http://log-service:3003/health > /dev/null 2>&1; then
+            echo "✅ Gateway ↔ Log Service communication works"
+          else
+            echo "❌ Gateway cannot reach Log Service internally"
+            exit 1
+          fi
+
+      - name: Test database volume mount
+        run: |
+          cd transcendence
+          echo "Testing database volume..."
+          
+          # Check if database volume is mounted correctly
+          if docker compose exec -T user-service ls -la /app/shared/ > /dev/null 2>&1; then
+            echo "✅ Shared volume is accessible in user-service"
+          else
+            echo "❌ Shared volume not mounted in user-service"
+            exit 1
+          fi
+
+      - name: Show service logs on failure
+        if: failure()
+        run: |
+          cd transcendence
+          echo "========================================================"
+          echo "🚨 INTEGRATION TEST FAILURE - DETAILED DIAGNOSTICS"
+          echo "========================================================"
+          echo ""
+          
+          echo "📊 CONTAINER STATUS:"
+          echo "----------------------------------------"
+          docker compose ps
+          echo ""
+          
+          echo "🌐 NETWORK INFORMATION:"
+          echo "----------------------------------------"
+          docker network ls | grep transcendence || echo "No transcendence networks found"
+          echo ""
+          
+          echo "💾 VOLUME INFORMATION:"
+          echo "----------------------------------------"
+          docker volume ls | grep transcendence || echo "No transcendence volumes found"
+          echo ""
+          
+          echo "🔍 HEALTH CHECK STATUS:"
+          echo "----------------------------------------"
+          echo "Testing Gateway health:"
+          docker compose exec -T gateway curl -f -s http://localhost:3000/health 2>/dev/null || echo "❌ Gateway health check failed"
+          
+          echo "Testing User Service health (internal):"
+          docker compose exec -T user-service wget -qO- http://localhost:3001/health 2>/dev/null || echo "❌ User Service health check failed"
+          
+          echo "Testing Game Service health (internal):"
+          docker compose exec -T game-service wget -qO- http://localhost:3002/health 2>/dev/null || echo "❌ Game Service health check failed"
+          
+          echo "Testing Log Service health (internal):"
+          docker compose exec -T log-service wget -qO- http://localhost:3003/health 2>/dev/null || echo "❌ Log Service health check failed"
+          
+          echo ""
+          echo "📋 SERVICE LOGS (Last 100 lines each):"
+          echo "========================================================"
+          
+          echo ""
+          echo "🌐 GATEWAY LOGS:"
+          echo "----------------------------------------"
+          docker compose logs gateway | tail -100
+          
+          echo ""
+          echo "👤 USER SERVICE LOGS:"
+          echo "----------------------------------------"
+          docker compose logs user-service | tail -100
+
+          echo ""
+          echo "<3 DATABASE SERVICE LOGS:"
+          echo "----------------------------------------"
+          docker compose logs database-service | tail -100
+
+          echo ""
+          echo "<3 DATABASE LOGS:"
+          echo "----------------------------------------"
+          docker compose logs database | tail -100
+          
+          echo ""
+          echo "🎮 GAME SERVICE LOGS:"
+          echo "----------------------------------------"
+          docker compose logs game-service | tail -100
+          
+          echo ""
+          echo "📝 LOG SERVICE LOGS:"
+          echo "----------------------------------------"
+          docker compose logs log-service | tail -100
+          
+          echo ""
+          echo "🏆 TOURNAMENT SERVICE LOGS:"
+          echo "----------------------------------------"
+          docker compose logs tournament-service | tail -50
+          
+          echo ""
+          echo "========================================================"
+          echo "🔧 TROUBLESHOOTING SUGGESTIONS:"
+          echo "========================================================"
+          echo "1. Services should be accessible via nginx proxy at https://localhost/api/"
+          echo "2. Services should ONLY be accessed via nginx proxy (no direct access)"
+          echo "3. Check for application startup errors in logs above"
+          echo "4. Verify inter-service DNS resolution (service-name:port)"
+          echo "5. Ensure health endpoints exist and return 200 status"
+          echo ""
+          echo "📞 To reproduce locally:"
+          echo "   cd transcendence"
+          echo "   docker compose up --build"
+          echo "   curl -k https://localhost/api/health"
+          echo "   curl -k https://localhost/api/user-service/health"
+          echo "========================================================"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          cd transcendence
+          docker compose down -v
+
+  test-development-mode:
+    runs-on: ubuntu-latest
+    needs: validate-docker-compose
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Test development docker-compose
+        run: |
+          cd transcendence
+          
+          if [ -f docker-compose.dev.yml ]; then
+            echo "Testing development configuration..."
+            
+            # Create test .env for development
+            cat > .env << EOF
+          NODE_ENV=development
+          DATABASE_URL=sqlite:/app/shared/database/transcendence.db
+          JWT_SECRET=dev-secret-key-for-ci-only-not-secure
+          
+          # Frontend URLs (Browser → nginx → gateway) - HTTP for CI testing  
+          VITE_API_BASE=http://localhost:8000/api
+          VITE_GATEWAY_BASE=http://localhost:8000/api
+          VITE_WS_BASE=ws://localhost:8000/ws
+          FRONT_END_URL=http://localhost:8000
+          
+          # Backend URLs (Docker internal network)
+          USER_SERVICE_URL=http://user-service:3001
+          GAME_SERVICE_URL=http://game-service:3002
+          LOG_SERVICE_URL=http://log-service:3003
+          TOURNAMENT_SERVICE_URL=http://tournament-service:3005
+          GATEWAY_URL=http://gateway:3000
+          # Service ports
+          GATEWAY_PORT=3000
+          USER_SERVICE_PORT=3001
+          GAME_SERVICE_PORT=3002
+          LOG_SERVICE_PORT=3003
+          TOURNAMENT_SERVICE_PORT=3004
+          FRONTEND_PORT=3005
+          # Service hosts
+          USER_SERVICE_HOST=user-service
+          GAME_SERVICE_HOST=game-service
+          LOG_SERVICE_HOST=log-service
+          TOURNAMENT_SERVICE_HOST=tournament-service
+          # Development settings
+          DEBUG=true
+          LOG_LEVEL=debug
+          EOF
+            
+            # Test development build
+            docker compose -f docker-compose.yml -f docker-compose.dev.yml build
+            echo "✅ Development configuration builds successfully"
+          else
+            echo "ℹ️ docker-compose.dev.yml not found, skipping development test"
+          fi
+
+  final-status:
+    runs-on: ubuntu-latest
+    needs: [validate-docker-compose, build-services, build-frontend, test-shared-resources, integration-test, test-development-mode]
+    if: always()
+    
+    steps:
+      - name: Comprehensive Pipeline Report
+        if: always()
+        run: |
+          echo "========================================================"
+          echo "🔍 DOCKER BUILD VALIDATION - COMPREHENSIVE REPORT"
+          echo "========================================================"
+          echo ""
+          
+          OVERALL_SUCCESS=true
+          FAILED_JOBS=""
+          
+          echo "📊 JOB STATUS SUMMARY:"
+          echo "----------------------------------------"
+          
+          if [ "${{ needs.validate-docker-compose.result }}" = "success" ]; then
+            echo "✅ Docker Compose Validation: PASSED"
+          else
+            echo "❌ Docker Compose Validation: FAILED"
+            OVERALL_SUCCESS=false
+            FAILED_JOBS="$FAILED_JOBS validate-docker-compose"
+          fi
+          
+          if [ "${{ needs.build-services.result }}" = "success" ]; then
+            echo "✅ Service Builds: PASSED"
+          else
+            echo "❌ Service Builds: FAILED"
+            OVERALL_SUCCESS=false
+            FAILED_JOBS="$FAILED_JOBS build-services"
+          fi
+          
+          if [ "${{ needs.build-frontend.result }}" = "success" ]; then
+            echo "✅ Frontend Build: PASSED"
+          else
+            echo "❌ Frontend Build: FAILED"
+            OVERALL_SUCCESS=false
+            FAILED_JOBS="$FAILED_JOBS build-frontend"
+          fi
+          
+          if [ "${{ needs.test-shared-resources.result }}" = "success" ]; then
+            echo "✅ Shared Resources Test: PASSED"
+          else
+            echo "❌ Shared Resources Test: FAILED"
+            OVERALL_SUCCESS=false
+            FAILED_JOBS="$FAILED_JOBS test-shared-resources"
+          fi
+          
+          if [ "${{ needs.integration-test.result }}" = "success" ]; then
+            echo "✅ Integration Tests: PASSED"
+          else
+            echo "❌ Integration Tests: FAILED"
+            OVERALL_SUCCESS=false
+            FAILED_JOBS="$FAILED_JOBS integration-test"
+          fi
+          
+          if [ "${{ needs.test-development-mode.result }}" = "success" ]; then
+            echo "✅ Development Mode Test: PASSED"
+          else
+            echo "❌ Development Mode Test: FAILED"
+            OVERALL_SUCCESS=false
+            FAILED_JOBS="$FAILED_JOBS test-development-mode"
+          fi
+          
+          echo ""
+          echo "========================================================"
+          
+          if [ "$OVERALL_SUCCESS" = true ]; then
+            echo "🎉 ALL TESTS PASSED!"
+            echo "✅ Docker setup is working correctly"
+            echo "✅ All services built successfully"
+            echo "✅ Gateway routing functional"
+            echo "✅ Inter-service communication works"
+            echo ""
+            echo "👍 Ready for deployment!"
+          else
+            echo "❌ PIPELINE FAILED"
+            echo ""
+            echo "🔧 FAILED JOBS: $FAILED_JOBS"
+            echo ""
+            echo "💡 KEY FIXES:"
+            echo "• All services must be accessed via Gateway"
+            echo "• No direct port access to internal services"
+            echo "• Gateway routes: /health, /user-service/*, /game-service/*"
+            echo ""
+            exit 1
+          fi
+          
+          echo "========================================================"

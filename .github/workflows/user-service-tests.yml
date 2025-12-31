@@ -1,0 +1,512 @@
+name: User Service API Tests
+
+on:
+  push:
+    branches:
+      - user-service
+      - main
+      - log-service
+      - db-service-api
+      - tournament_new
+      - microservices-refactor
+      - shenya-bug-fixes
+      #- fix-gateway-timeout-queue
+
+    # No paths restriction for push - always run when pushing to these branches
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'transcendence/services/user-service/**'
+      - 'transcendence/shared/**'
+      - '.github/workflows/user-service-tests.yml'
+
+jobs:
+  validate-structure:
+    runs-on: ubuntu-latest
+    name: Validate Project Structure
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate service structure
+        run: |
+          echo "🔍 Validating project structure..."
+          
+          # Check main directories
+          for dir in transcendence/services/user-service transcendence/shared; do
+            if [ -d "$dir" ]; then
+              echo "✅ $dir exists"
+            else
+              echo "❌ $dir missing"
+              exit 1
+            fi
+          done
+          
+          # Check essential files
+          essential_files=(
+            "transcendence/services/user-service/package.json"
+            "transcendence/services/user-service/src/index.js"
+            "transcendence/services/user-service/Dockerfile"
+            "transcendence/docker-compose.yml"
+          )
+          
+          for file in "${essential_files[@]}"; do
+            if [ -f "$file" ]; then
+              echo "✅ $file exists"
+            else
+              echo "❌ $file missing"
+              exit 1
+            fi
+          done
+
+  syntax-check:
+    runs-on: ubuntu-latest
+    needs: validate-structure
+    name: Syntax and Dependencies Check
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: |
+          cd transcendence/services/user-service
+          echo "📦 Installing user-service dependencies..."
+          npm install
+
+      - name: Check syntax
+        run: |
+          cd transcendence/services/user-service
+          echo "🔍 Checking JavaScript syntax..."
+          
+          # Check main file
+          node -c src/index.js
+          echo "✅ Main server file syntax OK"
+          
+          # Check all JS files in src
+          find src -name "*.js" -exec node -c {} \;
+          echo "✅ All source files syntax OK"
+
+      - name: Validate package.json
+        run: |
+          cd transcendence/services/user-service
+          echo "📋 Validating package.json..."
+          
+          if jq empty package.json; then
+            echo "✅ package.json is valid JSON"
+          else
+            echo "❌ package.json has syntax errors"
+            exit 1
+          fi
+          
+          # Check for required scripts
+          if jq -e '.scripts.start' package.json > /dev/null; then
+            echo "✅ Start script found"
+          else
+            echo "⚠️ No start script found"
+          fi
+
+  docker-build-test:
+    runs-on: ubuntu-latest
+    needs: syntax-check
+    name: Docker Build Test
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build user-service image
+        run: |
+          cd transcendence
+          echo "🐳 Building user-service Docker image..."
+          docker build -t user-service-test ./services/user-service
+          echo "✅ Docker build successful"
+
+      - name: Test Docker image
+        run: |
+          echo "🧪 Testing Docker image..."
+          
+          # Check if Node.js is available
+          docker run --rm user-service-test node --version
+          
+          # Check if app directory exists
+          docker run --rm user-service-test ls -la /app
+          
+          echo "✅ Docker image validation passed"
+
+  integration-test:
+    runs-on: ubuntu-latest
+    needs: docker-build-test
+    name: API Integration Tests
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate SSL certificates for HTTPS testing
+        run: |
+          cd transcendence
+          echo "🔐 Generating SSL certificates for testing..."
+          chmod +x generate-ssl.sh
+          ./generate-ssl.sh
+          
+      - name: Create test .env file for user service tests
+        run: |
+          cd transcendence
+          cat > .env << EOF
+          # CI/CD Override values - NOT FOR PRODUCTION
+          NODE_ENV=test
+          DATABASE_URL=sqlite:/app/shared/database/transcendence.db
+          JWT_SECRET=ci-test-secret-not-for-production
+          
+          # Frontend URLs (Browser → nginx → gateway) - HTTPS for production testing
+          VITE_API_BASE=https://localhost:8443/api
+          VITE_GATEWAY_BASE=https://localhost:8443/api
+          VITE_WS_BASE=wss://localhost:8443/ws
+          FRONT_END_URL=https://localhost:8443
+          
+          # Backend URLs (Docker internal network)
+          USER_SERVICE_URL=http://user-service:3001
+          GAME_SERVICE_URL=http://game-service:3002
+          LOG_SERVICE_URL=http://log-service:3003
+          TOURNAMENT_SERVICE_URL=http://tournament-service:3005
+          GATEWAY_URL=http://gateway:3000
+          # Service ports
+          GATEWAY_PORT=3000
+          USER_SERVICE_PORT=3001
+          GAME_SERVICE_PORT=3002
+          LOG_SERVICE_PORT=3003
+          TOURNAMENT_SERVICE_PORT=3004
+          FRONTEND_PORT=3005
+          # Service hosts
+          USER_SERVICE_HOST=user-service
+          GAME_SERVICE_HOST=game-service
+          LOG_SERVICE_HOST=log-service
+          TOURNAMENT_SERVICE_HOST=tournament-service
+          # Testing settings
+          DEBUG=false
+          LOG_LEVEL=info
+          EOF
+          echo "✅ Test .env file created for user service tests"
+
+      - name: Start test services
+        run: |
+          cd transcendence
+          echo "🚀 Starting services for testing..."
+          
+          # Start services with nginx proxy for HTTPS testing
+          docker compose up -d database database-service user-service log-service gateway nginx
+          
+          echo "⏳ Waiting for services to initialize..."
+          sleep 60
+
+      - name: Wait for services to be ready
+        run: |
+          cd transcendence
+          echo "🔍 Waiting for services to be ready..."
+          
+          timeout=90
+          elapsed=0
+          
+          while [ $elapsed -lt $timeout ]; do
+            # Check nginx health (HTTPS endpoint)
+            if curl -k -f -s https://localhost:8443/api/health > /dev/null 2>&1; then
+              echo "✅ nginx + Gateway is ready!"
+              
+              # Check user-service through nginx → gateway
+              if curl -k -f -s https://localhost:8443/api/user-service/health > /dev/null 2>&1; then
+                echo "✅ User service accessible via nginx → gateway!"
+                break
+              fi
+            fi
+            
+            echo "⏳ Waiting... ($elapsed/$timeout seconds)"
+            sleep 5
+            elapsed=$((elapsed + 5))
+          done
+          
+          if [ $elapsed -ge $timeout ]; then
+            echo "❌ Services failed to start"
+            echo "=== Gateway logs ==="
+            docker compose logs gateway | tail -50
+            echo "=== User-service logs ==="
+            docker compose logs user-service | tail -50
+            echo "=== Container status ==="
+            docker compose ps
+            exit 1
+          fi
+
+      - name: Run API tests
+        run: |
+          echo "🧪 Running API integration tests..."
+          
+          BASE_URL="https://localhost:8443/api"
+          
+          # Test 1: Health Check
+          echo "1. Testing health endpoint..."
+          HEALTH_RESPONSE=$(curl -k -s "$BASE_URL/user-service/health")
+          echo "Response: $HEALTH_RESPONSE"
+          
+          if echo "$HEALTH_RESPONSE" | grep -q "healthy"; then
+            echo "✅ Health check passed"
+          else
+            echo "❌ Health check failed"
+            exit 1
+          fi
+          
+          # Test 2: User Registration
+          echo "2. Testing user registration..."
+          UNIQUE_ID=$(date +%s)
+          
+          REGISTER_RESPONSE=$(curl -k -s -w "\n%{http_code}" \
+            -X POST "$BASE_URL/auth/register" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"username\": \"testuser$UNIQUE_ID\",
+              \"email\": \"test$UNIQUE_ID@example.com\",
+              \"password\": \"TestPassword123\"
+            }")
+          
+          HTTP_CODE=$(echo "$REGISTER_RESPONSE" | tail -n1)
+          RESPONSE_BODY=$(echo "$REGISTER_RESPONSE" | sed '$d')
+          
+          echo "HTTP Code: $HTTP_CODE"
+          echo "Response: $RESPONSE_BODY"
+          
+          if [ "$HTTP_CODE" = "201" ]; then
+            echo "✅ User registration successful"
+          else
+            echo "❌ User registration failed"
+            exit 1
+          fi
+          
+          # Extract token
+          TOKEN=$(echo "$RESPONSE_BODY" | jq -r '.token // empty')
+          
+          # Test 3: User Login
+          echo "3. Testing user login..."
+          
+          LOGIN_RESPONSE=$(curl -k -s -w "\n%{http_code}" \
+            -X POST "$BASE_URL/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"email\": \"test$UNIQUE_ID@example.com\",
+              \"password\": \"TestPassword123\"
+            }")
+          
+          HTTP_CODE=$(echo "$LOGIN_RESPONSE" | tail -n1)
+          RESPONSE_BODY=$(echo "$LOGIN_RESPONSE" | sed '$d')
+          
+          echo "HTTP Code: $HTTP_CODE"
+          echo "Response: $RESPONSE_BODY"
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ User login successful"
+          else
+            echo "❌ User login failed"
+            exit 1
+          fi
+          
+          # Test 4: Protected endpoint
+          if [ ! -z "$TOKEN" ]; then
+            echo "4. Testing protected profile endpoint..."
+            
+            PROFILE_RESPONSE=$(curl -k -s -w "\n%{http_code}" \
+              -X GET "$BASE_URL/auth/profile" \
+              -H "Authorization: Bearer $TOKEN")
+            
+            HTTP_CODE=$(echo "$PROFILE_RESPONSE" | tail -n1)
+            RESPONSE_BODY=$(echo "$PROFILE_RESPONSE" | sed '$d')
+            
+            echo "HTTP Code: $HTTP_CODE"
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ Profile access successful"
+              echo "$RESPONSE_BODY" | jq . || echo "$RESPONSE_BODY"
+            else
+              echo "⚠️  Profile access failed (HTTP $HTTP_CODE)"
+            fi
+          fi
+          
+          echo ""
+          echo "🎉 All API tests completed successfully!"
+
+      - name: Test error handling
+        run: |
+          echo "🧪 Testing API error handling..."
+          
+          BASE_URL="https://localhost:8443/api"
+          
+          # Test invalid registration
+          echo "Testing invalid registration data..."
+          RESPONSE=$(curl -k -s -w "\n%{http_code}" \
+            -X POST "$BASE_URL/auth/register" \
+            -H "Content-Type: application/json" \
+            -d '{"username": "test"}')
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          
+          if [ "$HTTP_CODE" = "400" ]; then
+            echo "✅ Invalid data properly rejected"
+          else
+            echo "⚠️  Expected 400 but got: $HTTP_CODE"
+          fi
+          
+          # Test invalid login
+          echo "Testing invalid login credentials..."
+          RESPONSE=$(curl -k -s -w "\n%{http_code}" \
+            -X POST "$BASE_URL/auth/login" \
+            -H "Content-Type: application/json" \
+            -d '{"email": "nonexistent@example.com", "password": "wrong"}')
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          
+          if [ "$HTTP_CODE" = "401" ]; then
+            echo "✅ Invalid credentials properly rejected"
+          else
+            echo "⚠️  Expected 401 but got: $HTTP_CODE"
+          fi
+          
+          # Test protected endpoint without token
+          echo "Testing protected endpoint without authentication..."
+          RESPONSE=$(curl -k -s -w "\n%{http_code}" \
+            -X GET "$BASE_URL/auth/profile")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          
+          if [ "$HTTP_CODE" = "401" ]; then
+            echo "✅ Unauthorized access properly blocked"
+          else
+            echo "⚠️  Expected 401 but got: $HTTP_CODE"
+          fi
+          
+          echo "✅ Error handling tests completed!"
+
+      - name: Show service logs on failure
+        if: failure()
+        run: |
+          cd transcendence
+          echo "=== User Service Logs ==="
+          docker compose logs user-service | tail -100
+          
+          echo "=== Gateway Logs ==="
+          docker compose logs gateway | tail -100
+          
+          echo "=== Database Service Logs ==="
+          docker compose logs database-service | tail -100
+          
+          echo "=== Container Status ==="
+          docker compose ps
+
+      - name: Cleanup
+        if: always()
+        run: |
+          cd transcendence
+          echo "🧹 Cleaning up test environment..."
+          docker compose down -v
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: syntax-check
+    name: Security Scan
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: |
+          cd transcendence/services/user-service
+          npm install
+
+      - name: Run security audit
+        run: |
+          cd transcendence/services/user-service
+          echo "🔒 Running security audit..."
+          
+          # Run npm audit
+          npm audit --audit-level=moderate || {
+            echo "⚠️ Security vulnerabilities found"
+            npm audit --audit-level=moderate --json > /tmp/audit.json
+            cat /tmp/audit.json | jq '.vulnerabilities'
+          }
+
+      - name: Check for secrets
+        run: |
+          echo "🔍 Scanning for potential secrets..."
+          
+          # Basic secret detection
+          if grep -r -i "password.*=" transcendence/services/user-service/src/ | grep -v -E "(bcrypt|hash|validate)" | grep -v test; then
+            echo "⚠️ Potential hardcoded passwords found"
+          else
+            echo "✅ No hardcoded passwords detected"
+          fi
+
+  final-status:
+    runs-on: ubuntu-latest
+    needs: [validate-structure, syntax-check, docker-build-test, integration-test, security-scan]
+    if: always()
+    name: Final Status Report
+    
+    steps:
+      - name: Report results
+        run: |
+          echo "=== API Testing Pipeline Results ==="
+          
+          if [ "${{ needs.validate-structure.result }}" = "success" ]; then
+            echo "✅ Structure validation passed"
+          else
+            echo "❌ Structure validation failed"
+          fi
+          
+          if [ "${{ needs.syntax-check.result }}" = "success" ]; then
+            echo "✅ Syntax check passed"
+          else
+            echo "❌ Syntax check failed"
+          fi
+          
+          if [ "${{ needs.docker-build-test.result }}" = "success" ]; then
+            echo "✅ Docker build test passed"
+          else
+            echo "❌ Docker build test failed"
+          fi
+          
+          if [ "${{ needs.integration-test.result }}" = "success" ]; then
+            echo "✅ Integration tests passed"
+          else
+            echo "❌ Integration tests failed"
+          fi
+          
+          if [ "${{ needs.security-scan.result }}" = "success" ]; then
+            echo "✅ Security scan passed"
+          else
+            echo "❌ Security scan failed"
+          fi
+          
+          # Determine overall success
+          if [ "${{ needs.validate-structure.result }}" != "success" ] || \
+             [ "${{ needs.syntax-check.result }}" != "success" ] || \
+             [ "${{ needs.integration-test.result }}" != "success" ]; then
+            echo "❌ Critical tests failed"
+            exit 1
+          fi
+          
+          echo "🎉 All critical tests passed!"

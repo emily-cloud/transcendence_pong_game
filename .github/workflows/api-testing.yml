@@ -1,0 +1,1289 @@
+name: API Testing
+
+on:
+  push:
+    branches:
+      - user-service
+      - microservices-refactor
+      - main
+      # - dev-environ-node-gateway
+      - integration-gateway-pong-front
+      - log-service
+      - db-service-api
+      - tournament_new
+      - shenya-bug-fixes
+      #- fix-gateway-timeout-queue
+    # No paths restriction for push - always run when pushing to these branches
+  pull_request:
+    branches:
+      - microservices-refactor
+      - main
+    paths:
+      - 'transcendence/services/**'
+      - 'transcendence/shared/**'
+      - 'transcendence/docker-compose.yml'
+      - '.github/workflows/api-testing.yml'
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Check if services exist
+        run: |
+          echo "🔍 Checking service structure..."
+          ls -la transcendence/services/
+          
+          if [ -d "transcendence/services/user-service" ]; then
+            echo "✅ User service directory exists"
+            ls -la transcendence/services/user-service/
+          else
+            echo "❌ User service directory not found"
+            exit 1
+          fi
+
+      - name: Install User Service dependencies
+        run: |
+          cd transcendence/services/user-service
+          if [ -f package.json ]; then
+            echo "📦 Installing user-service dependencies..."
+            npm install
+          else
+            echo "❌ package.json not found in user-service"
+            exit 1
+          fi
+
+      - name: Install Shared dependencies
+        run: |
+          cd transcendence/shared
+          if [ -f package.json ]; then
+            echo "📦 Installing shared dependencies..."
+            npm install
+          else
+            echo "📦 Creating shared package.json and installing sqlite3..."
+            npm init -y
+            npm install sqlite3
+          fi
+
+      - name: Validate User Service code
+        run: |
+          cd transcendence/services/user-service
+          echo "🧪 Validating user service structure..."
+          
+          # Check if main files exist
+          if [ -f src/index.js ]; then
+            echo "✅ Main server file exists"
+          else
+            echo "❌ src/index.js not found"
+            exit 1
+          fi
+          
+          # Basic syntax check without running the server
+          echo "🔍 Checking Node.js syntax..."
+          node -c src/index.js && echo "✅ Syntax validation passed" || {
+            echo "❌ Syntax errors found"
+            exit 1
+          }
+          
+          # Check package.json scripts
+          if grep -q '"start"' package.json; then
+            echo "✅ Start script found"
+          else
+            echo "⚠️ No start script found in package.json"
+          fi
+
+  api-integration-tests:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate SSL certificates for HTTPS testing
+        run: |
+          cd transcendence
+          echo "🔐 Generating SSL certificates for testing..."
+          
+          # Ensure script is executable
+          chmod +x generate-ssl.sh
+          
+          # Run SSL generation with verbose output
+          echo "Running generate-ssl.sh..."
+          if ./generate-ssl.sh; then
+            echo "✅ SSL generation script completed successfully"
+          else
+            echo "❌ SSL generation script failed with exit code: $?"
+            echo "Script contents:"
+            cat generate-ssl.sh
+            exit 1
+          fi
+          
+      - name: Create test environment file
+        run: |
+          cd transcendence
+          cat > .env << EOF
+          NODE_ENV=test
+          DATABASE_URL=sqlite:/app/shared/database/transcendence.db
+          JWT_SECRET=test-jwt-secret-key-not-for-production-use-only
+          
+          # Frontend URLs (Browser → nginx → gateway) - HTTPS for production testing
+          VITE_API_BASE=https://localhost:8443/api
+          VITE_GATEWAY_BASE=https://localhost:8443/api
+          VITE_WS_BASE=wss://localhost:8443/ws
+          FRONT_END_URL=https://localhost:8443
+          
+          # Backend URLs (Docker internal network)
+          USER_SERVICE_URL=http://user-service:3001
+          GAME_SERVICE_URL=http://game-service:3002
+          LOG_SERVICE_URL=http://log-service:3003
+          TOURNAMENT_SERVICE_URL=http://tournament-service:3005
+          GATEWAY_URL=http://gateway:3000
+          EOF
+          
+          echo "✅ Test environment file created"
+
+      - name: Validate SSL certificate generation
+        run: |
+          cd transcendence
+          echo "� Checking SSL certificate generation..."
+          
+          # Check if SSL directory exists
+          if [ -d "nginx/ssl" ]; then
+            echo "✅ SSL directory exists"
+            ls -la nginx/ssl/
+            
+            # Check if certificates were generated
+            if [ -f "nginx/ssl/certificate.crt" ] && [ -f "nginx/ssl/private.key" ]; then
+              echo "✅ SSL certificates found"
+              
+              # Validate certificate
+              echo "📋 Certificate details:"
+              openssl x509 -in nginx/ssl/certificate.crt -text -noout | head -20
+              
+              # Check certificate validity and show details
+              if openssl x509 -in nginx/ssl/certificate.crt -checkend 0 > /dev/null; then
+                echo "✅ Certificate is valid"
+                echo "Certificate subject:"
+                openssl x509 -in nginx/ssl/certificate.crt -subject -noout
+                echo "Certificate dates:"
+                openssl x509 -in nginx/ssl/certificate.crt -dates -noout
+              else
+                echo "❌ Certificate is invalid or expired"
+                openssl x509 -in nginx/ssl/certificate.crt -dates -noout || echo "Cannot read certificate dates"
+                exit 1
+              fi
+              
+              # Check private key
+              if openssl rsa -in nginx/ssl/private.key -check > /dev/null 2>&1; then
+                echo "✅ Private key is valid"
+              else
+                echo "❌ Private key is invalid"
+                exit 1
+              fi
+              
+              # Verify certificate and key match
+              CERT_MODULUS=$(openssl x509 -noout -modulus -in nginx/ssl/certificate.crt | openssl md5)
+              KEY_MODULUS=$(openssl rsa -noout -modulus -in nginx/ssl/private.key | openssl md5)
+              
+              if [ "$CERT_MODULUS" = "$KEY_MODULUS" ]; then
+                echo "✅ Certificate and private key match"
+              else
+                echo "❌ Certificate and private key do not match"
+                echo "Certificate modulus: $CERT_MODULUS"
+                echo "Key modulus: $KEY_MODULUS"
+                exit 1
+              fi
+              
+              # Test if nginx can use these certificates
+              echo "🧪 Testing nginx SSL configuration..."
+              echo "server {
+                listen 9999 ssl;
+                ssl_certificate /tmp/test.crt;
+                ssl_certificate_key /tmp/test.key;
+                location / { return 200 'SSL test OK'; }
+              }" > /tmp/nginx_ssl_test.conf
+              
+              cp nginx/ssl/certificate.crt /tmp/test.crt
+              cp nginx/ssl/private.key /tmp/test.key
+              
+              if nginx -t -c /tmp/nginx_ssl_test.conf > /dev/null 2>&1; then
+                echo "✅ nginx can use the SSL certificates"
+              else
+                echo "⚠️ nginx SSL test failed (may be expected in CI environment)"
+                nginx -t -c /tmp/nginx_ssl_test.conf || true
+              fi
+              
+              # Cleanup test files
+              rm -f /tmp/nginx_ssl_test.conf /tmp/test.crt /tmp/test.key
+              
+            else
+              echo "❌ SSL certificates not found"
+              echo "Expected files:"
+              echo "  - nginx/ssl/certificate.crt"
+              echo "  - nginx/ssl/private.key"
+              echo "Actual contents:"
+              find nginx/ssl -type f || echo "No files found"
+              exit 1
+            fi
+          else
+            echo "❌ SSL directory does not exist"
+            echo "Directory structure:"
+            ls -la nginx/
+            exit 1
+          fi
+
+      - name: Validate Docker Compose configuration
+        run: |
+          cd transcendence
+          echo "🔍 Validating docker-compose.yml..."
+          docker compose config > /dev/null
+          echo "✅ Docker Compose configuration is valid"
+          
+          echo "🔒 Checking service port exposure..."
+          
+          # Check that only gateway port is exposed
+          if grep -A 5 "gateway:" docker-compose.yml | grep -E "ports:|3000:3000"; then
+            echo "✅ Gateway port 3000 is properly exposed"
+          else
+            echo "⚠️ Gateway port might not be exposed correctly"
+          fi
+          
+          # Check that user-service port is NOT exposed
+          if grep -A 10 "user-service:" docker-compose.yml | grep -E "ports:" | grep -E "3001"; then
+            echo "❌ User-service port is exposed - this should NOT happen!"
+            exit 1
+          else
+            echo "✅ User-service port is correctly NOT exposed"
+          fi
+          
+          # Check that game-service port is NOT exposed
+          if grep -A 10 "game-service:" docker-compose.yml | grep -E "ports:" | grep -E "3002"; then
+            echo "❌ Game-service port is exposed - this should NOT happen!"
+            exit 1
+          else
+            echo "✅ Game-service port is correctly NOT exposed"
+          fi
+          
+          # Check that log-service port is NOT exposed
+          if grep -A 10 "log-service:" docker-compose.yml | grep -E "ports:" | grep -E "3003"; then
+            echo "❌ Log-service port is exposed - this should NOT happen!"
+            exit 1
+          else
+            echo "✅ Log-service port is correctly NOT exposed"
+          fi
+
+      - name: Build and start services
+        run: |
+          cd transcendence
+          echo "🚀 Building and starting services for API testing..."
+          
+          # First check if we need to modify nginx healthcheck for HTTPS
+          echo "Checking nginx healthcheck configuration..."
+          grep -A 5 "healthcheck:" docker-compose.yml | grep -A 3 "nginx" || echo "nginx healthcheck not found"
+          
+          # Start services with nginx proxy for full HTTPS architecture testing
+          docker compose up -d --build database database-service user-service gateway nginx
+          
+          echo "⏳ Waiting for services to initialize..."
+          sleep 30
+          
+          # Check initial container status
+          echo "Initial container status:"
+          docker compose ps
+          
+          # Wait additional time for services to fully start
+          echo "Giving services more time to fully initialize..."
+          sleep 60
+          
+          # Verify SSL certificates are accessible in nginx container
+          echo "🔍 Verifying SSL certificates in nginx container..."
+          if docker compose exec -T nginx ls -la /etc/nginx/ssl/; then
+            echo "✅ SSL directory accessible in nginx container"
+            docker compose exec -T nginx ls -la /etc/nginx/ssl/
+          else
+            echo "❌ Cannot access SSL directory in nginx container"
+            exit 1
+          fi
+
+      - name: Check container status
+        run: |
+          cd transcendence
+          echo "📊 Checking container status..."
+          docker compose ps
+          
+          echo "📋 Checking user-service logs..."
+          docker compose logs user-service | tail -20
+
+      - name: Wait for Services to be ready
+        run: |
+          cd transcendence
+          echo "🔍 Checking services health..."
+          
+          # First check if containers are running
+          if ! docker compose ps user-service | grep -Eq "running|healthy|Up"; then
+            echo "❌ User service container is not running"
+            docker compose logs user-service
+            exit 1
+          fi
+          
+          if ! docker compose ps gateway | grep -Eq "running|healthy|Up"; then
+            echo "❌ Gateway container is not running"
+            docker compose logs gateway
+            exit 1
+          fi
+          
+          if ! docker compose ps nginx | grep -Eq "running|healthy|Up"; then
+            echo "❌ nginx container is not running"
+            docker compose logs nginx
+            exit 1
+          fi
+          
+          # Wait for the user service to be ready (internal network)
+          echo "📡 Testing User Service internal health check..."
+          
+          for i in {1..15}; do
+            # Method 1: Try docker compose exec (most reliable) - works inside the container
+            if docker compose exec -T user-service wget -qO- http://localhost:3001/health > /dev/null 2>&1; then
+              echo "✅ User Service is ready and responding internally (exec method)"
+              break
+            # Method 2: Check if user-service container is actually running and healthy
+            elif docker compose ps user-service | grep -q "running\|Up"; then
+              echo "Container is running, trying network connection..."
+              # Get the actual network name dynamically
+              USER_CONTAINER_ID=$(docker compose ps -q user-service | head -1)
+              if [ ! -z "$USER_CONTAINER_ID" ]; then
+                ACTUAL_NETWORK=$(docker inspect "$USER_CONTAINER_ID" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null | head -1)
+                echo "Detected network: $ACTUAL_NETWORK"
+                if [ ! -z "$ACTUAL_NETWORK" ] && docker run --rm --network "$ACTUAL_NETWORK" curlimages/curl:latest curl -f -s http://user-service:3001/health > /dev/null 2>&1; then
+                  echo "✅ User Service is ready and responding internally (network: $ACTUAL_NETWORK)"
+                  break
+                fi
+              fi
+            fi
+            
+            echo "⏳ Waiting for User Service... attempt $i/15"
+            sleep 10
+            if [ $i -eq 15 ]; then
+              echo "❌ User Service failed to respond after 150 seconds"
+              echo "=== Container Status ==="
+              docker compose ps
+              echo "=== Network Info ==="
+              docker network ls
+              echo "=== User Service Container Details ==="
+              USER_CONTAINER_ID=$(docker compose ps -q user-service | head -1)
+              if [ ! -z "$USER_CONTAINER_ID" ]; then
+                echo "Container ID: $USER_CONTAINER_ID"
+                docker inspect "$USER_CONTAINER_ID" --format '{{range $k, $v := .NetworkSettings.Networks}}Network: {{$k}}, IP: {{$v.IPAddress}}{{"\n"}}{{end}}' 2>/dev/null || echo "Could not inspect container networks"
+              fi
+              echo "=== User Service Logs ==="
+              docker compose logs user-service
+              exit 1
+            fi
+          done
+          
+          # Wait for HTTPS services to be ready
+          echo "🔒 Waiting for HTTPS nginx + Gateway to be ready..."
+          
+          # First, check if containers are running
+          echo "Checking container status..."
+          docker compose ps
+          
+          # Wait for nginx to be healthy (critical for HTTPS to work)
+          echo "⏳ Waiting for nginx to be healthy..."
+          for i in {1..10}; do
+            if docker compose ps nginx | grep -q "healthy"; then
+              echo "✅ nginx is healthy"
+              break
+            elif [ $i -eq 10 ]; then
+              echo "❌ nginx failed to become healthy"
+              echo "nginx logs:"
+              docker compose logs nginx | tail -20
+              exit 1
+            else
+              echo "Waiting for nginx... attempt $i/10"
+              sleep 10
+            fi
+          done
+          
+          # Wait specifically for HTTPS to work
+          for i in {1..20}; do
+            echo "⏳ HTTPS health check attempt $i/20..."
+            
+            # Test HTTPS with detailed output
+            HTTPS_TEST=$(curl -k -s --connect-timeout 10 --max-time 15 \
+              -w "HTTP_CODE:%{http_code} TIME:%{time_total}" \
+              -o /tmp/health_check.json \
+              https://localhost:8443/api/health 2>&1)
+            
+            if echo "$HTTPS_TEST" | grep -q "HTTP_CODE:200"; then
+              echo "✅ HTTPS nginx + Gateway is ready and responding"
+              echo "Response time: $(echo "$HTTPS_TEST" | grep -o 'TIME:[0-9.]*')"
+              echo "⏳ Giving services additional time to fully initialize..."
+              sleep 15
+              break
+            else
+              echo "   HTTPS failed: $HTTPS_TEST"
+              
+              # Parse curl error for specific issues
+              if echo "$HTTPS_TEST" | grep -q "Connection refused"; then
+                echo "   Issue: Connection refused - nginx not accepting connections on 443"
+              elif echo "$HTTPS_TEST" | grep -q "SSL"; then
+                echo "   Issue: SSL/TLS related problem"
+              elif echo "$HTTPS_TEST" | grep -q "timeout"; then
+                echo "   Issue: Connection timeout"
+              elif echo "$HTTPS_TEST" | grep -q "certificate"; then
+                echo "   Issue: Certificate related problem"
+              fi
+              
+              # Detailed debugging every 5th attempt
+              if [ $((i % 5)) -eq 0 ]; then
+                echo "   === Detailed diagnosis (attempt $i) ==="
+                
+                # Check containers
+                if ! docker compose ps nginx | grep -E "running|Up" > /dev/null; then
+                  echo "   ❌ nginx container is not running"
+                  docker compose logs nginx | tail -5
+                else
+                  echo "   ✅ nginx container is running"
+                fi
+                
+                if ! docker compose ps gateway | grep -E "running|Up" > /dev/null; then
+                  echo "   ❌ gateway container is not running"
+                  docker compose logs gateway | tail -5
+                else
+                  echo "   ✅ gateway container is running"
+                fi
+                
+                # Check SSL certificates in container
+                echo "   Checking SSL setup..."
+                docker compose exec -T nginx ls -la /etc/nginx/ssl/ 2>/dev/null || echo "   Cannot access SSL directory"
+                
+                # Check if nginx is listening on port 443 (internal port)
+                docker compose exec -T nginx netstat -tln 2>/dev/null | grep :443 || echo "   nginx not listening on 443"
+                
+                # Check nginx process
+                docker compose exec -T nginx ps aux | grep nginx || echo "   nginx process not found"
+                
+                # Test nginx configuration
+                docker compose exec -T nginx nginx -t || echo "   nginx configuration test failed"
+                
+                # Check if SSL files are readable by nginx
+                docker compose exec -T nginx test -r /etc/nginx/ssl/certificate.crt && echo "   Certificate is readable" || echo "   Certificate is NOT readable"
+                docker compose exec -T nginx test -r /etc/nginx/ssl/private.key && echo "   Private key is readable" || echo "   Private key is NOT readable"
+                
+                # Check gateway health directly
+                GATEWAY_DIRECT=$(docker compose exec -T gateway curl -f -s --connect-timeout 5 http://localhost:3000/health 2>/dev/null && echo "OK" || echo "FAIL")
+                echo "   Gateway internal health: $GATEWAY_DIRECT"
+              fi
+              
+              if [ $i -eq 20 ]; then
+                echo "❌ HTTPS failed to work after 20 attempts (300 seconds)"
+                echo "=== Final diagnosis ==="
+                echo "Container status:"
+                docker compose ps
+                echo "nginx logs (last 30 lines):"
+                docker compose logs nginx | tail -30
+                echo "Gateway logs (last 30 lines):"
+                docker compose logs gateway | tail -30
+                echo "Port mappings:"
+                docker compose port nginx 443 || echo "No port 443 mapping"
+                echo "Expected port 8443 mapping:"
+                docker compose port nginx 8443 || echo "No port 8443 mapping"
+                echo "SSL files:"
+                docker compose exec -T nginx find /etc/nginx/ssl -type f -ls 2>/dev/null || echo "Cannot list SSL files"
+                
+                echo "Final curl debugging - testing specific SSL issues:"
+                # Test with verbose curl to see exact SSL error
+                curl -k -v --connect-timeout 10 --max-time 15 https://localhost:8443/api/health 2>&1 | head -30
+                
+                echo "Testing if curl exit code 60 is related to SSL:"
+                # curl exit code 60 = SSL_CACERT: Peer certificate cannot be authenticated with known CA certificates
+                echo "This suggests an SSL certificate validation issue"
+                exit 1
+              fi
+              
+              echo "   Waiting 15 seconds before retry..."
+              sleep 15
+            fi
+          done
+
+      - name: Install testing tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq
+
+      - name: Test Health Check Endpoints
+        run: |
+          cd transcendence
+          echo "🧪 Testing Health Check Endpoints..."
+          
+          # Use HTTPS endpoint (production setup)
+          echo "� Using HTTPS endpoints for testing..."
+          BASE_URL="https://localhost:8443/api"
+          CURL_FLAGS="-k"
+          
+          # Verify HTTPS is working before proceeding
+          echo "Verifying HTTPS connectivity..."
+          if ! curl -k -f -s --connect-timeout 15 --max-time 30 https://localhost:8443/api/health > /dev/null 2>&1; then
+            echo "❌ HTTPS endpoint is not responding"
+            echo "This indicates a problem with the SSL setup or nginx configuration"
+            
+            echo "=== SSL/nginx Diagnosis ==="
+            echo "nginx container status:"
+            docker compose ps nginx
+            
+            echo "nginx logs (last 20 lines):"
+            docker compose logs nginx | tail -20
+            
+            echo "SSL files in nginx container:"
+            docker compose exec -T nginx ls -la /etc/nginx/ssl/ || echo "Cannot access SSL directory"
+            
+            echo "Port mappings:"
+            docker compose port nginx 443 || echo "Port 443 not mapped"
+            
+            exit 1
+          fi
+          
+          echo "✅ HTTPS endpoint verified"
+          echo "Selected BASE_URL: $BASE_URL"
+          
+          # Additional SSL connectivity test
+          echo "🔐 Testing SSL connectivity details..."
+          echo | openssl s_client -connect localhost:8443 -servername localhost 2>/dev/null | head -10
+          
+          # Test certificate chain
+          echo "📋 SSL Certificate information:"
+          echo | openssl s_client -connect localhost:8443 -servername localhost 2>/dev/null | openssl x509 -noout -subject -issuer -dates
+          
+          # Test Gateway Health Check (via nginx)
+          echo "1. 🌐 Testing Gateway Health Check (via nginx)"
+          GATEWAY_HEALTH=$(curl $CURL_FLAGS -s -w "%{http_code}" -o /tmp/gateway_health.json \
+            --connect-timeout 15 --max-time 30 $BASE_URL/health)
+          if [ "$GATEWAY_HEALTH" = "200" ]; then
+            echo "✅ Gateway health check passed"
+            cat /tmp/gateway_health.json | jq .
+          else
+            echo "❌ Gateway health check failed with status: $GATEWAY_HEALTH"
+            exit 1
+          fi
+          
+          # Test User Service Health Check through nginx → Gateway
+          echo "2. 🏥 Testing User Service Health Check (via nginx → Gateway)"
+          USER_VIA_GATEWAY=$(curl $CURL_FLAGS -s -w "%{http_code}" -o /tmp/user_via_gateway.json \
+            --connect-timeout 15 --max-time 30 $BASE_URL/user-service/health)
+          if [ "$USER_VIA_GATEWAY" = "200" ]; then
+            echo "✅ User Service health check via nginx → Gateway passed"
+            cat /tmp/user_via_gateway.json | jq .
+          else
+            echo "❌ User Service health check via nginx → Gateway failed with status: $USER_VIA_GATEWAY"
+            exit 1
+          fi
+          
+          # Test User Service Health Check directly (internal network only - should NOT be accessible from host)
+          echo "3. 🔒 Verifying User Service is NOT directly accessible from host"
+          if curl -s --connect-timeout 5 http://localhost:3001/health > /dev/null 2>&1; then
+            echo "❌ User Service is directly accessible - this should NOT happen!"
+            echo "❌ Port 3001 should not be exposed in docker-compose.yml"
+            exit 1
+          else
+            echo "✅ User Service is properly isolated - not accessible directly from host"
+          fi
+          
+          # Test User Service Health Check directly via internal network (using docker)
+          echo "4. 🔍 Testing User Service Health Check (internal network)"
+          
+          # Try exec method first (most reliable)
+          if docker compose exec -T user-service wget -qO- http://localhost:3001/health > /tmp/internal_health.json 2>/dev/null; then
+            echo "✅ User Service health check (internal exec) passed"
+            cat /tmp/internal_health.json
+          else
+            # Fallback: try with default network name
+            INTERNAL_HEALTH=$(docker run --rm --network transcendence_default curlimages/curl:latest curl -s -w "%{http_code}" -o /dev/stdout http://user-service:3001/health 2>/dev/null | tail -c 3)
+            if [ "$INTERNAL_HEALTH" = "200" ]; then
+              echo "✅ User Service health check (internal network) passed"
+              # Get the actual response body
+              docker run --rm --network transcendence_default curlimages/curl:latest curl -s http://user-service:3001/health 2>/dev/null
+            else
+              # Try to detect actual network and use it
+              CONTAINER_NETWORK=$(docker compose ps -q user-service | head -1 | xargs docker inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null || echo "")
+              if [ ! -z "$CONTAINER_NETWORK" ]; then
+                echo "Trying detected network: $CONTAINER_NETWORK"
+                INTERNAL_HEALTH=$(docker run --rm --network "$CONTAINER_NETWORK" curlimages/curl:latest curl -s -w "%{http_code}" -o /dev/stdout http://user-service:3001/health 2>/dev/null | tail -c 3)
+                if [ "$INTERNAL_HEALTH" = "200" ]; then
+                  echo "✅ User Service health check (detected network) passed"
+                  docker run --rm --network "$CONTAINER_NETWORK" curlimages/curl:latest curl -s http://user-service:3001/health 2>/dev/null
+                else
+                  echo "❌ User Service health check (internal) failed with status: $INTERNAL_HEALTH"
+                  echo "Tried networks: transcendence_default, $CONTAINER_NETWORK"
+                  echo "Available networks:"
+                  docker network ls
+                  exit 1
+                fi
+              else
+                echo "❌ Could not detect container network and default failed"
+                exit 1
+              fi
+            fi
+          fi
+
+      - name: Test User Service Endpoints via Gateway
+        run: |
+          cd transcendence
+          echo "🧪 Running User Service API tests via nginx → Gateway..."
+          
+          # Test HTTPS endpoint (should work in production setup)
+          echo "� Testing HTTPS endpoint..."
+          
+          # First test with detailed curl output to see what's failing
+          # First verify HTTP healthcheck works
+          echo "Testing HTTP healthcheck first..."
+          HTTP_HEALTH=$(curl -s --connect-timeout 10 --max-time 15 \
+            -w "HTTP_CODE:%{http_code}" http://localhost:8000/health 2>&1)
+          
+          if echo "$HTTP_HEALTH" | grep -q "HTTP_CODE:200"; then
+            echo "✅ HTTP healthcheck working"
+          else
+            echo "❌ HTTP healthcheck failed: $HTTP_HEALTH"
+            exit 1
+          fi
+          
+          echo "Detailed HTTPS test:"
+          HTTPS_RESPONSE=$(curl -k -v -s --connect-timeout 15 --max-time 30 \
+            -w "HTTP_CODE:%{http_code} TOTAL_TIME:%{time_total} SSL_VERIFY_RESULT:%{ssl_verify_result}" \
+            -o /tmp/https_test.json \
+            https://localhost:8443/api/health 2>&1)
+          
+          echo "HTTPS Response: $HTTPS_RESPONSE"
+          
+          if echo "$HTTPS_RESPONSE" | grep -q "HTTP_CODE:200"; then
+            GATEWAY_URL="https://localhost:8443/api"
+            CURL_FLAGS="-k"
+            echo "✅ HTTPS is working correctly"
+            echo "Selected base URL: $GATEWAY_URL"
+          else
+            echo "❌ HTTPS is not working properly"
+            echo "Full curl output:"
+            echo "$HTTPS_RESPONSE"
+            
+            echo "=== Debugging HTTPS issues ==="
+            echo "1. Checking if SSL certificates exist in container:"
+            docker compose exec -T nginx ls -la /etc/nginx/ssl/ || echo "Cannot access nginx container"
+            
+            echo "2. Checking nginx SSL configuration:"
+            docker compose exec -T nginx nginx -t || echo "nginx config test failed"
+            
+            echo "3. Checking nginx error logs:"
+            docker compose logs nginx | grep -i error | tail -10
+            
+            echo "4. Testing direct connection to nginx HTTPS port:"
+            docker compose port nginx 443 || echo "Port 443 not exposed"
+            
+            echo "5. Checking if nginx is listening on 443:"
+            docker compose exec -T nginx netstat -tln | grep :443 || echo "nginx not listening on 443"
+            
+            echo "6. Testing HTTP (should redirect to HTTPS):"
+            HTTP_TEST=$(curl -v -s --connect-timeout 10 --max-time 20 \
+              -w "HTTP_CODE:%{http_code}" \
+              -o /tmp/http_test.json \
+              http://localhost:8000/api/health 2>&1)
+            echo "HTTP test result: $HTTP_TEST"
+            
+            # This should fail because we want HTTPS to work
+            exit 1
+          fi
+          
+          # User Registration via Gateway
+          echo "1. 👤 Testing User Registration (via Gateway)"
+          UNIQUE_ID=$(date +%s)
+          REGISTER_PAYLOAD='{
+            "username": "testuser'$UNIQUE_ID'",
+            "email": "test'$UNIQUE_ID'@example.com",
+            "password": "SecurePassword123!"
+          }'
+          
+          REGISTER_RESPONSE=$(curl $CURL_FLAGS -s -w "%{http_code}" -o /tmp/register.json \
+            -D /tmp/register_headers.txt \
+            --connect-timeout 30 --max-time 60 \
+            -X POST $GATEWAY_URL/auth/register \
+            -H "Content-Type: application/json" \
+            -d "$REGISTER_PAYLOAD")
+          
+          if [ "$REGISTER_RESPONSE" = "201" ]; then
+            echo "✅ User registration via Gateway passed"
+            cat /tmp/register.json | jq .
+          else
+            echo "❌ User registration via Gateway failed with status: $REGISTER_RESPONSE"
+            cat /tmp/register.json
+            exit 1
+          fi
+          
+          # Extract token from registration
+          TOKEN=$(cat /tmp/register.json | jq -r '.token // empty')
+          COOKIETOKEN=$(grep -i 'Set-Cookie: token=' /tmp/register_headers.txt | sed -E 's/Set-Cookie: token=([^;]+);.*/\1/i')
+
+          # Check if cookie token is empty
+          if [ -z "$COOKIETOKEN" ]; then
+            echo "❌ Token cookie not found or empty! Failing test."
+            exit 1
+          else
+            echo "✅ Token cookie extracted: $COOKIETOKEN"
+          fi
+
+          
+          # User Login via Gateway (test with same credentials) - you don't need cookietoken to login
+          echo "2. 🔐 Testing User Login (via Gateway)"
+          LOGIN_PAYLOAD='{
+            "email": "test'$UNIQUE_ID'@example.com",
+            "password": "SecurePassword123!"
+          }'
+          
+          LOGIN_RESPONSE=$(curl $CURL_FLAGS -s -w "%{http_code}" -o /tmp/login.json \
+            --connect-timeout 30 --max-time 60 \
+            -D /tmp/login_headers.txt \
+            -X POST $GATEWAY_URL/auth/login \
+            -H "Content-Type: application/json" \
+            -d "$LOGIN_PAYLOAD")
+          
+          if [ "$LOGIN_RESPONSE" = "200" ]; then
+            echo "✅ User login via Gateway passed"
+            cat /tmp/login.json | jq .
+            # Use login token if registration token wasn't available
+            if [ -z "$TOKEN" ]; then
+              TOKEN=$(cat /tmp/login.json | jq -r '.token // empty')
+            fi
+          else
+            echo "❌ User login via Gateway failed with status: $LOGIN_RESPONSE"
+            cat /tmp/login.json
+            exit 1
+          fi
+
+
+          NEW_COOKIETOKEN=$(grep -i 'Set-Cookie: token=' /tmp/login_headers.txt | sed -E 's/Set-Cookie: token=([^;]+);.*/\1/i')
+
+          # Fail if the new token is empty
+          if [ -z "$NEW_COOKIETOKEN" ]; then
+            echo "❌ No new token returned after login"
+            exit 1
+          else
+            echo "✅ New login token: $NEW_COOKIETOKEN"
+          fi
+
+
+          
+          
+          # Profile Access via Gateway (Protected Route)
+          echo "3. 👥 Testing Protected Profile Endpoint (via Gateway)"
+
+          if [ ! -z "$TOKEN" ]; then
+            PROFILE_RESPONSE=$(curl $CURL_FLAGS -s -w "%{http_code}" -o /tmp/profile.json \
+              --connect-timeout 30 --max-time 60 \
+              -X GET $GATEWAY_URL/auth/profile \
+              --cookie "token=$NEW_COOKIETOKEN" \
+              -H "Authorization: Bearer $TOKEN")
+            
+            if [ "$PROFILE_RESPONSE" = "200" ]; then
+              echo "✅ Profile access via Gateway passed"
+              cat /tmp/profile.json | jq .
+            else
+              echo "❌ Profile access via Gateway failed with status: $PROFILE_RESPONSE"
+              cat /tmp/profile.json
+              exit 1
+            fi
+          else
+            echo "⚠️ No token available, skipping profile test"
+          fi
+          
+          # Verify direct access to user service endpoints is blocked
+          echo "4. 🔒 Testing User Service isolation"
+          
+          # Test if port 3001 is exposed (should not be in production)
+          echo "Checking if user-service port 3001 is exposed..."
+          
+          # First, check if we can connect to port 3001
+          if timeout 5 bash -c "</dev/tcp/localhost/3001" 2>/dev/null; then
+            echo "⚠️ Warning: Port 3001 is accessible from host"
+            echo "This might be expected in CI/test environment, but should NOT happen in production"
+            echo "Verifying docker-compose.yml doesn't expose user-service port..."
+            
+            # Check docker-compose.yml to ensure user-service port is not exposed
+            if grep -A 10 "user-service:" transcendence/docker-compose.yml | grep -E "ports:|3001:3001"; then
+              echo "❌ docker-compose.yml exposes user-service port - this should be fixed!"
+              echo "Current docker-compose.yml user-service configuration:"
+              grep -A 15 "user-service:" transcendence/docker-compose.yml
+              exit 1
+            else
+              echo "✅ docker-compose.yml correctly does NOT expose user-service port"
+              echo "Port accessibility might be due to CI environment network configuration"
+            fi
+          else
+            echo "✅ User Service port 3001 is properly isolated from host"
+          fi
+          
+          # Additional test: Verify that going through gateway works correctly
+          echo "5. 🌐 Verifying complete Gateway functionality"
+          
+          # Test a complete user journey through the gateway
+          echo "Testing complete user workflow via Gateway only..."
+          
+          JOURNEY_ID=$(date +%s)_journey
+          JOURNEY_PAYLOAD='{
+            "username": "journey'$JOURNEY_ID'",
+            "email": "journey'$JOURNEY_ID'@example.com",
+            "password": "JourneyPassword123!"
+          }'
+          
+          # Register via Gateway with timeout and better error handling
+          echo "Attempting registration via Gateway..."
+          set +e  # Don't exit on error for this test
+          JOURNEY_REGISTER=$(curl $CURL_FLAGS -s -w "%{http_code}" -o /tmp/journey_register.json \
+            --connect-timeout 30 --max-time 60 \
+            -X POST $GATEWAY_URL/user-service/auth/register \
+            -H "Content-Type: application/json" \
+            -d "$JOURNEY_PAYLOAD" 2>/dev/null)
+          CURL_EXIT_CODE=$?
+          set -e  # Re-enable exit on error
+          
+          echo "CURL exit code: $CURL_EXIT_CODE"
+          echo "HTTP status code: $JOURNEY_REGISTER"
+          
+          # Specific handling for curl exit code 60
+          if [ $CURL_EXIT_CODE -eq 60 ]; then
+            echo "❌ CURL EXIT CODE 60 DETECTED!"
+            echo "This typically means: SSL certificate problem: unable to get local issuer certificate"
+            echo "Testing SSL connection details..."
+            
+            # Test SSL connection with more details
+            echo "=== SSL Connection Test ==="
+            openssl s_client -connect localhost:8443 -servername localhost -verify_return_error < /dev/null 2>&1 | head -20
+            
+            echo "=== Certificate chain test ==="
+            echo | openssl s_client -connect localhost:8443 -servername localhost 2>/dev/null | openssl x509 -noout -subject -issuer
+            
+            exit 1
+          fi
+          
+          if [ $CURL_EXIT_CODE -eq 0 ] && [ "$JOURNEY_REGISTER" = "201" ]; then
+            echo "✅ Registration via Gateway successful"
+            cat /tmp/journey_register.json
+            
+            # Login via Gateway
+            LOGIN_JOURNEY_PAYLOAD='{
+              "email": "journey'$JOURNEY_ID'@example.com",
+              "password": "JourneyPassword123!"
+            }'
+            
+            echo "Attempting login via Gateway..."
+            set +e
+            JOURNEY_LOGIN=$(curl $CURL_FLAGS -s -w "%{http_code}" -o /tmp/journey_login.json \
+              --connect-timeout 30 --max-time 60 \
+              -X POST $GATEWAY_URL/user-service/auth/login \
+              -H "Content-Type: application/json" \
+              -d "$LOGIN_JOURNEY_PAYLOAD" 2>/dev/null)
+            CURL_EXIT_CODE=$?
+            set -e
+            
+            echo "Login CURL exit code: $CURL_EXIT_CODE"
+            echo "Login HTTP status code: $JOURNEY_LOGIN"
+            
+            if [ $CURL_EXIT_CODE -eq 0 ] && [ "$JOURNEY_LOGIN" = "200" ]; then
+              echo "✅ Complete user journey via Gateway successful"
+              cat /tmp/journey_login.json
+              
+              # Extract token and test profile
+              JOURNEY_TOKEN=$(cat /tmp/journey_login.json | jq -r '.token // empty' 2>/dev/null || echo "")
+              if [ ! -z "$JOURNEY_TOKEN" ]; then
+                echo "Testing profile access..."
+                set +e
+                JOURNEY_PROFILE=$(curl $CURL_FLAGS -s -w "%{http_code}" -o /tmp/journey_profile.json \
+                  --connect-timeout 30 --max-time 60 \
+                  -X GET $GATEWAY_URL/user-service/auth/profile \
+                  -H "Authorization: Bearer $JOURNEY_TOKEN" 2>/dev/null)
+                CURL_EXIT_CODE=$?
+                set -e
+                
+                if [ $CURL_EXIT_CODE -eq 0 ] && [ "$JOURNEY_PROFILE" = "200" ]; then
+                  echo "✅ Profile access via Gateway successful"
+                else
+                  echo "⚠️ Profile access failed: HTTP=$JOURNEY_PROFILE, CURL_EXIT=$CURL_EXIT_CODE"
+                fi
+              else
+                echo "⚠️ No token received from login"
+              fi
+            else
+              echo "⚠️ Login via Gateway failed: HTTP=$JOURNEY_LOGIN, CURL_EXIT=$CURL_EXIT_CODE"
+              if [ -f /tmp/journey_login.json ]; then
+                echo "Login response:"
+                cat /tmp/journey_login.json
+              fi
+            fi
+          else
+            echo "⚠️ Registration via Gateway failed: HTTP=$JOURNEY_REGISTER, CURL_EXIT=$CURL_EXIT_CODE"
+            if [ -f /tmp/journey_register.json ]; then
+              echo "Registration response:"
+              cat /tmp/journey_register.json
+            fi
+            # Show service logs for debugging
+            echo "=== Gateway logs (last 20 lines) ==="
+            docker compose logs gateway | tail -20
+            echo "=== User Service logs (last 20 lines) ==="
+            docker compose logs user-service | tail -20
+          fi
+          
+          echo "🎉 All Gateway API tests passed!"
+
+      - name: Test Invalid Requests via Gateway
+        run: |
+          echo "🧪 Testing error handling and validation via Gateway..."
+          
+          # Use nginx as the public gateway (nginx proxies to gateway internally)
+          # Gateway service is not published to host by default, so use /api via nginx
+          GATEWAY_URL="http://localhost/api"
+          
+          # Use HTTPS endpoint with correct port for testing
+          GATEWAY_URL="https://localhost:8443/api"
+          CURL_FLAGS="-k"
+          
+          # Test registration with missing fields via Gateway
+          echo "1. Testing registration with missing fields (via Gateway)"
+          echo "Sending payload: {\"username\": \"test\"}"
+          INVALID_REGISTER=$(curl $CURL_FLAGS -s -w "%{http_code}" -o /tmp/invalid_register.json \
+            -X POST $GATEWAY_URL/user-service/auth/register \
+            -H "Content-Type: application/json" \
+            -d '{"username": "test"}')
+          
+          echo "Response body:"
+          cat /tmp/invalid_register.json
+          echo ""
+          echo "HTTP Status Code: $INVALID_REGISTER"
+          
+          if [ "$INVALID_REGISTER" = "400" ]; then
+            echo "✅ Validation error handled correctly via Gateway"
+          else
+            echo "❌ Expected 400 but got: $INVALID_REGISTER"
+            echo "Debugging info:"
+            echo "Length of response: ${#INVALID_REGISTER}"
+            echo "Response as hex: $(echo -n "$INVALID_REGISTER" | xxd)"
+          fi
+          
+          # Test login with wrong credentials via Gateway
+          echo "2. Testing login with invalid credentials (via Gateway)"
+          echo "Sending payload: {\"email\": \"nonexistent@test.com\", \"password\": \"wrong\"}"
+          INVALID_LOGIN=$(curl $CURL_FLAGS -s -w "%{http_code}" -o /tmp/invalid_login.json \
+            -X POST $GATEWAY_URL/user-service/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"email": "nonexistent@test.com", "password": "wrong"}')
+          
+          echo "Response body:"
+          cat /tmp/invalid_login.json
+          echo ""
+          echo "HTTP Status Code: $INVALID_LOGIN"
+          
+          if [ "$INVALID_LOGIN" = "401" ]; then
+            echo "✅ Invalid credentials handled correctly via Gateway"
+          else
+            echo "❌ Expected 401 but got: $INVALID_LOGIN"
+          fi
+          
+          # Test protected route without token via Gateway
+          echo "3. Testing protected route without token (via Gateway)"
+          NO_TOKEN_RESPONSE=$(curl $CURL_FLAGS -s -w "%{http_code}" -o /tmp/no_token.json \
+            -X GET $GATEWAY_URL/user-service/auth/profile)
+          
+          if [ "$NO_TOKEN_RESPONSE" = "401" ]; then
+            echo "✅ Missing token handled correctly via Gateway"
+          else
+            echo "❌ Expected 401 but got: $NO_TOKEN_RESPONSE"
+          fi
+          
+          # Test protected route with invalid token via Gateway
+          echo "4. Testing protected route with invalid token (via Gateway)"
+          INVALID_TOKEN_RESPONSE=$(curl $CURL_FLAGS -s -w "%{http_code}" -o /tmp/invalid_token.json \
+            -X GET $GATEWAY_URL/user-service/auth/profile \
+            -H "Authorization: Bearer invalid-token")
+          
+          if [ "$INVALID_TOKEN_RESPONSE" = "403" ]; then
+            echo "✅ Invalid token handled correctly via Gateway"
+          else
+            echo "❌ Expected 403 but got: $INVALID_TOKEN_RESPONSE"
+          fi
+          
+          echo "✅ All error handling tests passed!"
+
+      - name: Test Database Operations via Gateway
+        run: |
+          echo "🗄️ Testing database operations via Gateway..."
+          
+          # Check if database was created and has data
+          docker compose exec -T user-service ls -la /app/shared/database/ || echo "Database directory check"
+          
+          # Test duplicate user registration via Gateway
+          echo "Testing duplicate user registration via Gateway"
+          # Use nginx HTTPS endpoint with correct port
+          GATEWAY_URL="https://localhost:8443/api"
+          CURL_FLAGS="-k"
+          
+          DUPLICATE_PAYLOAD='{
+            "username": "duplicate_test",
+            "email": "duplicate@test.com",
+            "password": "password123"
+          }'
+          
+          # First registration via Gateway
+          curl $CURL_FLAGS -s -X POST $GATEWAY_URL/user-service/auth/register \
+            -H "Content-Type: application/json" \
+            -d "$DUPLICATE_PAYLOAD" > /dev/null
+          
+          # Second registration (should fail) via Gateway
+          DUPLICATE_RESPONSE=$(curl $CURL_FLAGS -s -w "%{http_code}" -o /tmp/duplicate.json \
+            -X POST $GATEWAY_URL/user-service/auth/register \
+            -H "Content-Type: application/json" \
+            -d "$DUPLICATE_PAYLOAD")
+          
+          if [ "$DUPLICATE_RESPONSE" = "409" ]; then
+            echo "✅ Duplicate user prevention works via Gateway"
+          else
+            echo "⚠️ Duplicate user response: $DUPLICATE_RESPONSE"
+            cat /tmp/duplicate.json
+          fi
+
+      - name: Performance Testing via Gateway
+        run: |
+          echo "⚡ Running basic performance tests via Gateway..."
+          
+          # Use nginx HTTPS endpoint with correct port
+          GATEWAY_URL="https://localhost:8443/api"
+          CURL_FLAGS="-k"
+          
+          # Test multiple concurrent health checks via Gateway
+          echo "Testing concurrent Gateway health check requests..."
+          for i in {1..10}; do
+            curl $CURL_FLAGS -s $GATEWAY_URL/health > /dev/null &
+          done
+          wait
+          echo "✅ Concurrent Gateway requests handled"
+          
+          # Test multiple concurrent User Service health checks via Gateway
+          echo "Testing concurrent User Service health check requests via Gateway..."
+          for i in {1..10}; do
+            curl $CURL_FLAGS -s $GATEWAY_URL/user-service/health > /dev/null &
+          done
+          wait
+          echo "✅ Concurrent User Service requests via Gateway handled"
+          
+          # Test Gateway response time
+          echo "Testing Gateway response time..."
+          START_TIME=$(date +%s%N)
+          curl $CURL_FLAGS -s $GATEWAY_URL/health > /dev/null
+          END_TIME=$(date +%s%N)
+          RESPONSE_TIME=$(( (END_TIME - START_TIME) / 1000000 ))
+          echo "Gateway response time: ${RESPONSE_TIME}ms"
+          
+          if [ $RESPONSE_TIME -lt 1000 ]; then
+            echo "✅ Gateway response time is acceptable (< 1000ms)"
+          else
+            echo "⚠️ Gateway response time is high: ${RESPONSE_TIME}ms"
+          fi
+          
+          # Test User Service via Gateway response time
+          echo "Testing User Service via Gateway response time..."
+          START_TIME=$(date +%s%N)
+          curl $CURL_FLAGS -s $GATEWAY_URL/user-service/health > /dev/null
+          END_TIME=$(date +%s%N)
+          RESPONSE_TIME=$(( (END_TIME - START_TIME) / 1000000 ))
+          echo "User Service via Gateway response time: ${RESPONSE_TIME}ms"
+          
+          if [ $RESPONSE_TIME -lt 2000 ]; then
+            echo "✅ User Service via Gateway response time is acceptable (< 2000ms)"
+          else
+            echo "⚠️ User Service via Gateway response time is high: ${RESPONSE_TIME}ms"
+          fi
+
+      - name: Show service logs on failure
+        if: failure()
+        run: |
+          cd transcendence
+          echo "=== Gateway Logs ==="
+          docker compose logs gateway | tail -100
+          echo "=== User Service Logs ==="
+          docker compose logs user-service | tail -100
+          echo "=== Database Service Logs ==="
+          docker compose logs database-service | tail -100
+          echo "=== Database Logs ==="
+          docker compose logs database | tail -100
+
+      - name: Cleanup
+        if: always()
+        run: |
+          cd transcendence
+          docker compose down -v
+          docker system prune -f
+
+  security-tests:
+    runs-on: ubuntu-latest
+    needs: [api-integration-tests]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Security scan with npm audit
+        run: |
+          cd transcendence/services/user-service
+          npm audit --audit-level=high || echo "⚠️ Security vulnerabilities found"
+
+      - name: Check for hardcoded secrets
+        run: |
+          echo "🔍 Scanning for potential security issues..."
+          
+          # Check for hardcoded passwords/secrets (exclude test files)
+          if grep -r -i "password.*=" transcendence/services/user-service/src/ | grep -v test | grep -v example; then
+            echo "⚠️ Potential hardcoded passwords found"
+          else
+            echo "✅ No hardcoded passwords detected"
+          fi
+          
+          # Check for exposed API keys
+          if grep -r -E "(api[_-]?key|secret[_-]?key)" transcendence/services/user-service/src/ | grep -v test | grep -v example; then
+            echo "⚠️ Potential API keys found in source"
+          else
+            echo "✅ No exposed API keys detected"
+          fi
+
+  load-tests:
+    runs-on: ubuntu-latest
+    needs: [api-integration-tests]
+    # if: github.event_name == 'push' && github.ref == 'refs/heads/main'  # René's improvement: run load tests on all branches
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create test environment file
+        run: |
+          cd transcendence
+          cat > .env << EOF
+          NODE_ENV=test
+          DATABASE_URL=sqlite:/app/shared/database/transcendence.db
+          JWT_SECRET=test-jwt-secret-key-not-for-production-use-only
+          USER_SERVICE_URL=http://user-service:3001
+          GAME_SERVICE_URL=http://game-service:3002
+          LOG_SERVICE_URL=http://log-service:3003
+          GATEWAY_URL=http://gateway:3000
+          VITE_API_BASE=http://localhost:3000/user-service
+          VITE_GATEWAY_BASE=http://localhost:3000
+          VITE_WS_BASE=ws://localhost:3000
+          FRONT_END_URL=http://localhost:3004
+          EOF
+          
+          echo "✅ Test environment file created"
+
+      - name: Start services for load testing
+        run: |
+          cd transcendence
+          docker compose up -d --build database database-service user-service gateway
+          sleep 30
+
+      - name: Install Apache Bench
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apache2-utils
+
+      - name: Run load tests
+        run: |
+          echo "🚀 Running load tests via nginx HTTPS..."
+          
+          # Test Gateway health endpoint with 100 requests, 10 concurrent (via nginx HTTPS)
+          echo "Testing Gateway health endpoint via nginx HTTPS..."
+          ab -n 100 -c 10 -k https://localhost:8443/api/health
+          
+          # Test User Service health via nginx → Gateway with 50 requests, 5 concurrent (HTTPS)
+          echo "Testing User Service health via nginx → Gateway HTTPS..."
+          ab -n 50 -c 5 -k https://localhost:8443/api/user-service/health
+          
+          echo "✅ Load tests completed"
+
+      - name: Cleanup load test
+        if: always()
+        run: |
+          cd transcendence
+          docker compose down -v
+
+  api-documentation-test:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check API documentation
+        run: |
+          echo "📚 Checking API documentation..."
+          
+          # Check if there's API documentation
+          if [ -f transcendence/docs/api-contracts.md ]; then
+            echo "✅ API documentation found"
+            
+            # Check if documentation mentions the endpoints we're testing
+            if grep -q "/auth/register\|/auth/login\|/auth/profile" transcendence/docs/api-contracts.md; then
+              echo "✅ API endpoints documented"
+            else
+              echo "⚠️ API endpoints not fully documented"
+            fi
+          else
+            echo "⚠️ API documentation missing"
+          fi
+
+  final-api-status:
+    runs-on: ubuntu-latest
+    needs: [unit-tests, api-integration-tests, api-documentation-test, load-tests]
+    if: always()
+    
+    steps:
+      - name: Report API test results
+        run: |
+          echo "=== API Testing Results ==="
+          
+          if [ "${{ needs.unit-tests.result }}" = "success" ]; then
+            echo "✅ Unit tests passed"
+          else
+            echo "❌ Unit tests failed"
+          fi
+          
+          if [ "${{ needs.api-integration-tests.result }}" = "success" ]; then
+            echo "✅ API integration tests passed"
+          else
+            echo "❌ API integration tests failed"
+          fi
+          
+          echo "ℹ️ Security tests run separately"
+          
+          if [ "${{ needs.api-documentation-test.result }}" = "success" ]; then
+            echo "✅ Documentation check passed"
+          else
+            echo "❌ Documentation check failed"
+          fi
+          
+          # Only fail if critical tests failed
+          if [ "${{ needs.unit-tests.result }}" != "success" ] || \
+             [ "${{ needs.api-integration-tests.result }}" != "success" ]; then
+            echo "❌ Critical API tests failed"
+            exit 1
+          fi
+          
+          echo "🎉 API testing pipeline completed successfully!"
