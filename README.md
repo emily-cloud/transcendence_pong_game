@@ -105,10 +105,19 @@ cd transcendence ; make start
 cd transcendence ; make
 ```
 
-5. **Access the application**
+4. **Access the application**
 - Frontend: https://localhost:8443
 - Kibana (monitoring only): http://localhost:5601
 - SQLite Admin: http://localhost:8080
+
+5. **Clean the application**
+- `make clean` — remove temporary and compiled files  
+- `make fclean` — full cleanup including binaries
+
+```bash
+cd transcendence ; make clean
+cd transcendence ; make 
+```
 
 ### Getting Started
 
