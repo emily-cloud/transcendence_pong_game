@@ -84,8 +84,8 @@
 
 1. **Clone the repository**
 ```bash
-git clone https://github.com/Zzzhenya/ft_transcnd.git
-cd ft_transcnd/transcendence
+https://github.com/emily-cloud/transcendence_pong_game.git
+cd transcendence_pong_game/transcendence
 ```
 
 2. **Configure environment variables**
@@ -116,6 +116,70 @@ cd transcendence ; make
 2. Create your profile and upload an avatar
 3. Start a local game or join a tournament
 4. Invite friends for remote matches
+
+### Getting Started
+
+1. **Register a new account or use the test account**  
+   After accessing the platform, create a new player profile or log in using one of the provided test accounts.
+
+2. **Set up your profile and upload an avatar**  
+   Personalize your player identity with an avatar and profile details—these will appear in matches, friend lists, and tournaments.
+
+3. **Start a local game or join a tournament**  
+   You can warm up in a local match or immediately join an online tournament where brackets are generated automatically.
+
+4. **Invite friends for remote matches**  
+   Play against others in real time via WebSockets, challenge friends, or join public games.
+
+---
+
+### 🎮 Gameplay Preview
+
+Below are a few example screenshots showing what the user will experience when playing:
+
+🏠 Lobby
+
+The lobby is the main landing area where users can navigate to game modes, view friends, manage profiles, or join active matches.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/emily-cloud/transcendence_pong_game/main/game_screenshot/Screenshot%202025-12-31%20at%2014.30.49.png" 
+       alt="Main Gameplay Screen" width="75%">
+</p>
+
+👤 User Profile
+
+Each player has a customizable profile with avatar upload, statistics, match history, and friend management.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/emily-cloud/transcendence_pong_game/main/game_screenshot/Screenshot%202025-12-31%20at%2014.31.50.png" 
+       alt="Lobby or Pre-Match" width="75%">
+</p>
+
+🌐 Remote Game Lobby
+
+Players can join remote matches, invite friends, or wait for opponents in real time.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/emily-cloud/transcendence_pong_game/main/game_screenshot/Screenshot%202025-12-31%20at%2014.32.28.png" 
+       alt="3D Arena" width="75%">
+</p>
+
+🏆 Tournament Lobby  
+The Tournament Lobby allows players to join or create tournaments, view brackets, and follow match progress in real time.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/emily-cloud/transcendence_pong_game/main/game_screenshot/Screenshot%202025-12-31%20at%2014.36.09.png" 
+       alt="Tournament Lobby" width="75%">
+</p>
+
+
+**➡️ 3D Arena & Visual Effects**  
+The Babylon.js engine provides smooth lighting, shadows, and camera transitions during gameplay.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/emily-cloud/transcendence_pong_game/main/game_screenshot/Screenshot%202025-12-31%20at%2014.32.16.png" 
+       alt="3D Arena Visual 2" width="75%">
+</p>
 
 ## 🎓 42 School Project
 
@@ -155,18 +219,15 @@ This project was developed as part of the 42 School curriculum.
 
 ## 👥 Author
 
-Rene
-Jason
-Shenya
-Irene
-Emily
-
-**Owner (Zzzhenya)**
-- GitHub: [@Zzzhenya](https://github.com/Zzzhenya)
+Huayun Ai
+René Kost
+Taekeun Kwak
+Shenya De Silva
+Irene Rivero Casal
 
 ## 🙏 Acknowledgments
 
-- 42 School for the project
+- 42 School project
 - Babylon.js Community
 - Fastify Framework
 - Elastic Stack Team
