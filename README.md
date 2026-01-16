@@ -148,7 +148,7 @@ Below are a few example screenshots showing what the user will experience when p
 
 🏠 Lobby
 
-The lobby is the main landing area where users can navigate to game modes, view friends, manage profiles, or join active matches.
+The lobby is the main landing area where users can navigate to game modes and register or login as user to continue playing game.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/emily-cloud/transcendence_pong_game/main/game_screenshot/Screenshot%202025-12-31%20at%2014.30.49.png" 
