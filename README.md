@@ -228,10 +228,10 @@ This project was developed as part of the 42 School curriculum.
 
 ## 👥 Author
 
-Huayun Ai
-René Kost
-Taekeun Kwak
-Shenya De Silva
+Huayun Ai  
+René Kost   
+Taekeun Kwak   
+Shenya De Silva   
 Irene Rivero Casal
 
 ## 🙏 Acknowledgments
